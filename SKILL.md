@@ -26,14 +26,21 @@ The user is the product manager or technical lead.
 
 Load [JUMP.md](JUMP.md) and use it to find resources by name and description, then open only the relevant resources.
 
-The user's request is parsed into tasks.
-Subagents can spawn other subagents. 
-Subagents perform tasks.
-Tasks can generate subagents.
-
 ## Working standard
 
-For every user request, make a proportional plan and split it into independent tasks. Assign each task to an implementation subagent, separating ownership and write targets as much as possible to prevent conflicts. Assign separate quality-manager subagents to independently verify each result and the integrated outcome. If QA finds a defect or unmet requirement, return it to the responsible implementation subagent, then repeat QA; only QA-approved work is complete. Aim for production-ready work unless the user requests otherwise. Be exact about completed and remaining work, limitations, temporary measures, and whether a result is minimal or production-ready. Never hide uncertainty or present unverified work as complete.
+For every non-trivial user request:
+1. Make a plan proportional to the request.
+2. Split the work into independent tasks whenever it can be split safely.
+3. Assign each task to an implementation subagent. Give every task a clear goal, scope, and acceptance criteria. Keep file ownership separate where possible to avoid conflicts.
+4. Assign separate quality-manager subagents to verify each completed task and the integrated result independently.
+5. If QA finds a defect or an unmet requirement, return the task to its implementation subagent with the QA evidence. Run QA again after the fix.
+6. Mark work complete only after QA approves it.
+
+Implementation subagents perform their assigned tasks. Subagents may spawn other subagents. Tasks may generate subagents.
+
+Aim for production-ready work unless the user requests a smaller or temporary result. Be precise about what is complete, what remains, known limitations, temporary measures, and whether validation occurred. Do not hide uncertainty or describe unverified work as complete.
+
+Work always needs to be audited and tested.
 
 ## Skill growth
 
