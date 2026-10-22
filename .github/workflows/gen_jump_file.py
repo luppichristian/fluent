@@ -17,7 +17,13 @@ DESCRIPTION = re.compile(r"^\s*(?:(?:#|//|;|::)\s*|REM\s+)?description\s*:\s*(.+
 
 def files_in(directory: Path) -> list[Path]:
     return sorted(
-        (path for path in directory.rglob("*") if path.is_file() and not any(part in IGNORED_NAMES for part in path.parts)),
+        (
+            path
+            for path in directory.rglob("*")
+            if path.is_file()
+            and path.suffix.lower() == ".md"
+            and not any(part in IGNORED_NAMES for part in path.parts)
+        ),
         key=lambda path: path.as_posix().lower(),
     )
 

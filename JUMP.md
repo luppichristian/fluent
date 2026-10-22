@@ -8,7 +8,7 @@
 
 ## scripts
 
-- [scripts/example.md](scripts/example.md): Template for reusable development scripts.
+- [scripts/cpu_info.md](scripts/cpu_info.md): Cross-platform CPU hardware, instruction-set, cache, and utilization inspector.
 
 ## subagents
 
