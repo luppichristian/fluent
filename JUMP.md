@@ -9,6 +9,8 @@
 ## scripts
 
 - [scripts/cpu_info.md](scripts/cpu_info.md): Cross-platform CPU hardware, instruction-set, cache, and utilization inspector.
+- [scripts/hardware_info.md](scripts/hardware_info.md): Cross-platform hardware inventory for chassis, memory, storage, graphics, networking, power, and sensors.
+- [scripts/system_info.md](scripts/system_info.md): Cross-platform operating system, runtime, and current-user inspector.
 
 ## subagents
 
