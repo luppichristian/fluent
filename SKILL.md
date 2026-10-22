@@ -5,7 +5,8 @@ description: Develop professional C projects, including targeted CUDA, shader, a
 
 # fluent
 
-Protocols for professional C projects, including targeted CUDA, GLSL/HLSL, and assembly work. The user is the product manager or technical lead.
+Protocols for professional C projects, including targeted CUDA, GLSL/HLSL, and assembly work. 
+The user is the product manager or technical lead.
 
 ## Areas
 
@@ -18,16 +19,17 @@ Protocols for professional C projects, including targeted CUDA, GLSL/HLSL, and a
 
 ## Resources
 
-- [tasks](tasks/): reusable procedures; check for a matching task before defining new work.
-- [guidelines](guidelines/): focused rules and protocols; read only what applies.
-- [subagents](subagents/): implementation and QA delegation prompts.
-- [scripts](scripts/): generic, reusable operations and tooling.
+- [tasks](tasks/): reusable procedures; check for matching tasks in the user's request and apply instructions.
+- [rules](rules/): focused rules and protocols; read only what applies.
+- [subagents](subagents/): specific prompts for spawning subagents.
+- [scripts](scripts/): generic, reusable scripts and tooling.
 
-Use [JUMP.md](JUMP.md) as the resource index.
+Load [JUMP.md](JUMP.md) and use it to find resources by name and description, then open only the relevant resources.
 
-## Metadata
-
-Every task, guideline, subagent prompt, and script needs a leading `description` metadata field. Markdown uses YAML frontmatter; code uses its native comment syntax (for example, `# description: ...`). The [generator](.github/workflows/gen_jump_file.py), called by the [workflow](.github/workflows/generate-jump.yml), exposes these descriptions in `JUMP.md` and rejects missing metadata.
+The user's request is parsed into tasks.
+Subagents can spawn other subagents. 
+Subagents perform tasks.
+Tasks can generate subagents.
 
 ## Working standard
 
@@ -35,4 +37,4 @@ For every user request, make a proportional plan and split it into independent t
 
 ## Skill growth
 
-When work produces a proven, likely-reusable asset, update this skill as part of the work: operations go in `scripts/`, procedures in `tasks/`, durable rules in `guidelines/`, and delegation patterns in `subagents/`. Add its description metadata, then run `python .github/workflows/gen_jump_file.py`. Search first and extend a compatible resource rather than duplicating it; create a focused file only when it has distinct future value. Do not save task-specific details or speculation. Preserve callers and validate changed scripts.
+When work produces a proven, likely-reusable asset, update this skill as part of the work: operations go in `scripts/`, procedures in `tasks/`, durable rules in `rules/`, and delegation patterns in `subagents/`. Add its description metadata and manually update its entry in `JUMP.md`. Search first and extend a compatible resource rather than duplicating it; create a focused file only when it has distinct future value. Do not save task-specific details or speculation. Preserve callers and validate changed scripts.
