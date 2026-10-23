@@ -22,7 +22,7 @@ The user is the product manager or technical lead.
 - [tasks](tasks/): reusable procedures; check for matching tasks in the user's request and apply instructions.
 - [rules](rules/): focused rules and protocols; read only what applies.
 - [subagents](subagents/): specific prompts for spawning subagents.
-- [scripts](scripts/): generic, reusable scripts and tooling.
+- [scripts](scripts/): generic, reusable crossplatform scripts and tooling.
 
 Load [JUMP.md](JUMP.md) and use it to find resources by name and description, then open only the relevant resources.
 
