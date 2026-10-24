@@ -10,7 +10,7 @@
 
 - [scripts/audio_info.md](scripts/audio_info.md): Inspect the local OpenAL runtime, its output devices, extensions, and default-device capabilities.
 - [scripts/gpu_info.md](scripts/gpu_info.md): Read-only GPU inventory plus vendor-feature evidence and graphics/compute API diagnostics.
-- [scripts/machine_info.md](scripts/machine_info.md): Read-only cross-platform report of system, hardware, and CPU capabilities.
+- [scripts/machine_info.md](scripts/machine_info.md): Read-only report of system, hardware, and CPU capabilities.
 
 ## subagents
 

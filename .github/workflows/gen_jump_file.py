@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RESOURCE_DIRS = ("rules", "scripts", "subagents", "tasks")
+RESOURCE_DIRS = ("rules", "scripts", "subagents", "procs")
 IGNORED_NAMES = {"__pycache__", ".DS_Store"}
 DESCRIPTION = re.compile(r"^\s*(?:(?:#|//|;|::)\s*|REM\s+)?description\s*:\s*(.+?)\s*$", re.IGNORECASE)
 

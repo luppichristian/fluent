@@ -21,6 +21,8 @@ Each capability carries its source where possible. `unknown`, `unavailable`, or 
 python scripts/gpu_info.py
 python scripts/gpu_info.py --sections nvidia,cuda,vulkan --json
 python scripts/gpu_info.py --full --include-dxdiag --json
+python scripts/gpu_info.py --full --profile llm --redact default --json
+python scripts/gpu_info.py --sections direct3d --smoke-test d3d11,d3d12 --json
 ```
 
 The default report includes adapter inventory, detected NVIDIA/AMD sections, and Direct3D on Windows or Metal on macOS. It does not run optional API probes or DxDiag.
@@ -34,14 +36,24 @@ The default report includes adapter inventory, detected NVIDIA/AMD sections, and
 | `--full` | Run all sections; cannot be combined with `--sections`; skips DxDiag by default. |
 | `--include-dxdiag` | With `--full`, explicitly enable DxDiag. Conflicts with `--skip-dxdiag`; otherwise has no effect. |
 | `--skip-dxdiag` | Suppress DxDiag when Direct3D runs. Overview and `--full` skip it; explicitly requesting `direct3d` enables it unless this flag is set. |
+| `--smoke-test LIST` | Opt-in active initialization probe. `d3d11` creates a D3D11 device for Windows' default hardware adapter and records its selected feature level. `d3d12` creates the default D3D12 device and queries documented base Options tiers. `all` runs both. Each immediately releases its device; neither renders, benchmarks, or proves an application path. |
+| `--profile full\|llm\|summary` | `full` is the existing raw-evidence view. `llm` and `summary` emit a bounded cross-API capability profile without large Vulkan/DxDiag/tool payloads. Combine `--full --profile llm` to collect all APIs but transport only the compact view. |
+| `--redact none\|default\|strict` | Replace local identifiers in emitted or saved reports. Use `default` before sharing; `none` remains the compatibility default. |
+| `--requirements PATH` | Evaluate a JSON requirements manifest against the full report before it is summarized. |
+| `--compare PATH` / `--save PATH` | Add a bounded comparison to an earlier JSON snapshot or save the final redacted full report. |
+| `--envelope` | Wrap full evidence in the common `tool`/`status`/`metadata` envelope while preserving the default raw contract when omitted. |
+| `--output-schema` | Print the requirements-manifest contract and exit without collecting. |
+| `--report-schema` | Print the Draft 2020-12 JSON Schema for legacy or enveloped GPU reports. |
 | `-h`, `--help` | Show command help. |
 
 Unknown sections and conflicting options exit with an error.
 
 ## JSON output
 
-Top-level keys are `schema_version`, `platform`, `request`, `inventory`, `vendors`, `apis`, and `executed_sections`. Unrequested vendor/API sections are `null`; requested sections contain their payload. A failed optional probe is recorded as `collector_error` while other requested sections continue.
+Full-report top-level keys are `schema_version`, `platform`, `request`, `inventory`, `vendors`, `apis`, `executed_sections`, and `smoke_tests` (plus common metadata/output controls). Unrequested vendor/API sections are `null`; requested sections contain their payload. A failed optional probe is recorded as `collector_error` while other requested sections continue.
+
+The compact profile has normalized API status/provenance, a conservative canonical-adapter matrix, and Windows active-display diagnostics from DisplayConfig: active adapter paths, refresh rate, HDR/advanced-color support and enabled state, and hybrid-topology evidence. NVIDIA telemetry is included when `nvidia-smi` provides it. On Windows it also records the current user's variable-refresh-rate preference if the documented DirectX user-preferences registry value is present; that is not proof of monitor support or per-application activation. It matches identities by UUID, PCI, or an exact OS PNP identity where exposed; a name-only association is explicitly labelled lower confidence. It does **not** silently equate CUDA, Vulkan, OS, or Direct3D ordinals.
 
 ## Notes
 
-All probes are read-only, but some may start local system tools. `--full` can take longer; DxDiag may stall and briefly creates then removes its report. GPU names and PCI IDs identify hardware, not game integration, driver activation, feature enablement, or performance. Reports can contain adapter names, driver versions, PCI IDs, and local paths; review JSON before sharing.
+All inventory probes are read-only, but `--smoke-test d3d11` and `d3d12` are explicit exceptions: they initialize then release a default Direct3D device and report `passed`, `unavailable`, or `not_applicable`; no result is inferred from an adapter name. The probes do not create a queue, surface, command list, or renderer. `--full` can take longer; DxDiag may stall and briefly creates then removes its report. GPU names and PCI IDs identify hardware, not game integration, driver activation, feature enablement, or performance. Reports can contain adapter names, driver versions, PCI IDs, and local paths; review JSON before sharing.

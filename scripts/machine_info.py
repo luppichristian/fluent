@@ -4,9 +4,229 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import ctypes
+import hashlib
 import json
+import os
 import platform
-from typing import Any
+import re
+import shutil
+import socket
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+
+# This file deliberately embeds the transport helpers instead of importing a
+# sibling module: diagnostic scripts must remain usable after being copied out
+# of this repository.  Keep the command-line contract aligned with the other
+# collectors, but do not make this executable depend on its launch directory.
+_COMMON_STATUS_VALUES = ("available", "unsupported", "unavailable", "denied", "failed", "unknown")
+_REDACTION_LEVELS = ("none", "default", "strict")
+
+
+def add_common_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--profile", choices=("full", "llm", "summary"), default="full", help="output view: full evidence (default), bounded LLM view, or compact summary")
+    parser.add_argument("--redact", choices=_REDACTION_LEVELS, default="none", help="replace sensitive local identifiers before output or saving (default: none for compatibility)")
+    parser.add_argument("--requirements", metavar="PATH", help="evaluate a JSON requirements manifest against this report")
+    parser.add_argument("--compare", metavar="PATH", help="compare the report with a prior JSON snapshot")
+    parser.add_argument("--save", metavar="PATH", help="write the final JSON report to a snapshot file")
+    parser.add_argument("--envelope", action="store_true", help="wrap full evidence in the common tool/status/metadata envelope")
+    parser.add_argument("--output-schema", action="store_true", help="print the common requirements-manifest schema and exit")
+    parser.add_argument("--report-schema", action="store_true", help="print the machine-report JSON Schema and exit")
+
+
+def requirements_schema() -> dict[str, Any]:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://fluent.local/schemas/diagnostic-requirements-1.json",
+        "schema_version": 1,
+        "type": "object",
+        "required": ["requirements"],
+        "properties": {"requirements": {"type": "array", "items": {"type": "object", "required": ["path"], "properties": {"id": {"type": "string"}, "path": {"type": "string"}, "operator": {"enum": ["exists", "equals", "not_equals", "contains", "gte", "lte"]}, "description": {"type": "string"}}}}},
+        "description": "A requirements manifest is an object containing a requirements array.",
+        "requirement": {"id": "stable human-readable identifier", "path": "dot path in the emitted full report; list indexes use [0]", "operator": ["exists", "equals", "not_equals", "contains", "gte", "lte"], "value": "required except for exists", "description": "optional explanation shown in the result"},
+        "status_values": list(_COMMON_STATUS_VALUES),
+        "example": {"requirements": [{"id": "logical-cpus", "path": "sections.cpu.cpu.logical_cores", "operator": "gte", "value": 8}]},
+    }
+
+
+def report_schema() -> dict[str, Any]:
+    return {"$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://fluent.local/schemas/machine-info-report-1.json", "title": "Fluent machine_info report", "oneOf": [{"type": "object", "required": ["schema_version", "platform", "selected_sections", "sections"], "properties": {"schema_version": {"type": "integer", "const": 1}, "platform": {"type": "object"}, "selected_sections": {"type": "array", "items": {"enum": ["system", "hardware", "cpu"]}}, "sections": {"type": "object"}}, "additionalProperties": True}, {"type": "object", "required": ["schema_version", "tool", "status", "metadata", "data"], "properties": {"schema_version": {"type": "integer", "const": 1}, "tool": {"const": "machine_info"}, "status": {"type": "string"}, "metadata": {"type": "object"}, "data": {"type": "object"}}, "additionalProperties": True}]}
+
+
+def _redacted(value: Any) -> str:
+    return "<redacted:%s>" % hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _sensitive_key(key: str, level: str) -> bool:
+    normalized = key.casefold().replace("-", "_")
+    default = ("serial", "uuid", "mac", "ip", "address", "addresses", "id", "hostname", "fqdn", "username", "qualified_name", "home", "path", "pnp_device_id", "pci_bus_id", "device_id", "executable", "working_directory")
+    strict = default + ("name", "model", "manufacturer", "vendor", "driver", "group", "environment", "variables")
+    # Match complete field components: ``mac_address`` is sensitive, while
+    # ``machine`` must remain a structural platform/status field.
+    return any(normalized == token or normalized.startswith(token + "_") or normalized.endswith("_" + token) for token in (strict if level == "strict" else default))
+
+
+def _path_is_sensitive(path: str, level: str) -> bool:
+    """Recognize a report path without needing to resolve its possibly-redacted value."""
+    return any(_sensitive_key(part, level) for part in re.split(r"[.\[\]]+", path) if part)
+
+
+def _redact(value: Any, level: str, sensitive: bool = False) -> Any:
+    """Redact scalar leaves while preserving every object/list container."""
+    if level == "none":
+        return copy.deepcopy(value)
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        report_path = value.get("path")
+        is_reference_entry = isinstance(report_path, str) and (
+            "operator" in value or "before" in value or "after" in value
+        )
+        for key, item in value.items():
+            # Compatibility and comparison entries retain a source path next to
+            # the copied raw value.  That source controls sensitivity of the
+            # value even though keys such as "actual" and "before" are generic.
+            path_sensitive = (
+                key in {"actual", "before", "after"}
+                and isinstance(report_path, str)
+                and _path_is_sensitive(report_path, level)
+            )
+            # Manifest result ``id`` and its symbolic ``path`` are stable
+            # labels, not collected machine identifiers.
+            key_sensitive = _sensitive_key(str(key), level) and not (key in {"path", "id"} and is_reference_entry)
+            result[key] = _redact(item, level, sensitive or key_sensitive or path_sensitive)
+        return result
+    if isinstance(value, list):
+        return [_redact(item, level, sensitive) for item in value]
+    return _redacted(value) if sensitive and value not in (None, "") else value
+
+
+def _resolve_path(document: Any, path: str) -> tuple[bool, Any]:
+    current = document
+    for raw in path.split("."):
+        match = re.fullmatch(r"([^\[]+)?(?:\[(\d+)\])?", raw)
+        if not match:
+            return False, None
+        key, index = match.groups()
+        if key:
+            if not isinstance(current, dict) or key not in current:
+                return False, None
+            current = current[key]
+        if index is not None:
+            try:
+                current = current[int(index)]
+            except (IndexError, TypeError):
+                return False, None
+    return True, current
+
+
+def _evaluate_requirements(report: dict[str, Any], path: str) -> dict[str, Any]:
+    try:
+        manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return {"status": "failed", "manifest": path, "error": str(error), "results": []}
+    entries = manifest.get("requirements") if isinstance(manifest, dict) else None
+    if not isinstance(entries, list):
+        return {"status": "failed", "manifest": path, "error": "manifest must contain a requirements array", "results": []}
+    results: list[dict[str, Any]] = []
+    operators = {"exists", "equals", "not_equals", "contains", "gte", "lte"}
+    for index, item in enumerate(entries):
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            results.append({"id": "requirement-%d" % index, "status": "failed", "error": "requirement needs a string path"})
+            continue
+        exists, actual = _resolve_path(report, item["path"])
+        operator, expected = item.get("operator", "exists"), item.get("value")
+        status = "unknown" if not exists or actual is None else "failed"
+        try:
+            if operator == "exists":
+                status = "passed" if exists and actual is not None else "unknown"
+            elif operator == "equals" and exists and actual is not None:
+                status = "passed" if actual == expected else "failed"
+            elif operator == "not_equals" and exists and actual is not None:
+                status = "passed" if actual != expected else "failed"
+            elif operator == "contains" and exists and actual is not None:
+                status = "passed" if expected in actual else "failed"
+            elif operator == "gte" and exists and actual is not None:
+                status = "passed" if actual >= expected else "failed"
+            elif operator == "lte" and exists and actual is not None:
+                status = "passed" if actual <= expected else "failed"
+            elif operator not in operators:
+                status, actual = "failed", "unsupported operator: %s" % operator
+        except (TypeError, ValueError):
+            status = "unknown"
+        results.append({"id": item.get("id", "requirement-%d" % index), "description": item.get("description"), "path": item["path"], "operator": operator, "expected": expected, "actual": actual, "status": status})
+    overall = "passed" if results and all(item["status"] == "passed" for item in results) else "failed" if any(item["status"] == "failed" for item in results) else "unknown"
+    return {"status": overall, "manifest": path, "results": results}
+
+
+def _flatten(value: Any, prefix: str = "", result: dict[str, Any] | None = None) -> dict[str, Any]:
+    result = {} if result is None else result
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _flatten(item, "%s.%s" % (prefix, key) if prefix else str(key), result)
+    elif isinstance(value, list):
+        result[prefix] = value
+    else:
+        result[prefix] = value
+    return result
+
+
+def _compare_snapshot(report: dict[str, Any], path: str, maximum_changes: int = 200) -> dict[str, Any]:
+    try:
+        prior = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return {"status": "failed", "snapshot": path, "error": str(error), "changes": []}
+    def comparable(value: Any) -> Any:
+        value = copy.deepcopy(value)
+        if isinstance(value, dict):
+            value.pop("comparison", None)
+            metadata = value.get("metadata")
+            if isinstance(metadata, dict):
+                metadata.pop("collected_at_utc", None)
+            for item in value.values(): comparable(item)
+        elif isinstance(value, list):
+            for item in value: comparable(item)
+        return value
+    before, after = _flatten(comparable(prior)), _flatten(comparable(report))
+    def change_kind(key: str) -> str:
+        if key not in before: return "added"
+        if key not in after: return "removed"
+        old, new = before[key], after[key]
+        if (old is True and new is False) or (isinstance(old, (int, float)) and not isinstance(old, bool) and isinstance(new, (int, float)) and not isinstance(new, bool) and new < old): return "regressed"
+        if isinstance(old, str) and isinstance(new, str) and old in {"available", "passed"} and new in {"unavailable", "unsupported", "denied", "failed"}: return "regressed"
+        return "changed"
+    changes = [{"path": key, "before": before.get(key), "after": after.get(key), "kind": change_kind(key)} for key in sorted(set(before) | set(after)) if before.get(key) != after.get(key)]
+    return {"status": "changed" if changes else "unchanged", "snapshot": path, "change_count": len(changes), "truncated": len(changes) > maximum_changes, "changes": changes[:maximum_changes]}
+
+
+def finalize_report(report: dict[str, Any], args: argparse.Namespace, tool: str, summary: Callable[[dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
+    """Apply standalone LLM, privacy, requirement, and snapshot controls."""
+    enhanced = any((args.profile != "full", args.redact != "none", args.requirements, args.compare, args.save, args.envelope))
+    if not enhanced:
+        return copy.deepcopy(report)
+    enriched = copy.deepcopy(report)
+    enriched.setdefault("metadata", {})
+    enriched["metadata"].update({"tool": tool, "collected_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "redaction": args.redact})
+    if args.requirements:
+        enriched["compatibility"] = _evaluate_requirements(enriched, args.requirements)
+    if args.compare:
+        enriched["comparison"] = _compare_snapshot(enriched, args.compare)
+    redacted = _redact(enriched, args.redact)
+    if args.save:
+        target = Path(args.save)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(redacted, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
+    if args.envelope and args.profile == "full":
+        compact = summary(redacted)
+        return {"schema_version": 1, "tool": tool, "metadata": redacted["metadata"], "status": compact.get("status", "unknown"), "data": redacted, "compatibility": redacted.get("compatibility"), "comparison": redacted.get("comparison")}
+    if args.profile == "full":
+        return redacted
+    compact = summary(redacted)
+    return {"schema_version": 1, "tool": tool, "metadata": redacted["metadata"], "status": compact.get("status", "unknown"), "summary": compact, "compatibility": redacted.get("compatibility"), "comparison": redacted.get("comparison")}
 
 
 # Collector implementations are intentionally nested in factories.  This keeps
@@ -875,6 +1095,448 @@ collect_cpu_info = _build_cpu_collector()
 del _build_cpu_collector
 
 
+# Developer context is deliberately separate from the historic three section
+# reports.  It is opt-in because command discovery and interface addresses are
+# useful for a build/compatibility investigation but unnecessary for a small
+# inventory call.  Every new probe keeps its evidence source and distinguishes
+# no data from an unsupported or denied probe.
+_STATUS_AVAILABLE = "available"
+_STATUS_UNAVAILABLE = "unavailable"
+_STATUS_UNSUPPORTED = "unsupported"
+_STATUS_UNKNOWN = "unknown"
+
+
+def _probe(status: str, source: str, value: Any = None, detail: str | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {"status": status, "source": source, "value": value}
+    if detail:
+        result["detail"] = detail
+    return result
+
+
+def _read_optional(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip() or None
+    except OSError:
+        return None
+
+
+def _command_version(command: tuple[str, ...]) -> dict[str, Any]:
+    """Capture one fixed tool version with executable and command provenance."""
+    executable = shutil.which(command[0])
+    if not executable:
+        return _probe(_STATUS_UNAVAILABLE, "PATH", {"command": list(command), "executable": None, "version": None})
+    try:
+        completed = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4, check=False)
+    except subprocess.TimeoutExpired:
+        return _probe("failed", "subprocess", {"command": list(command), "executable": executable, "version": None}, "timed out after 4 seconds")
+    except OSError as error:
+        return _probe("failed", "subprocess", {"command": list(command), "executable": executable, "version": None}, str(error))
+    output = (completed.stdout or completed.stderr).strip()
+    first_line = output.splitlines()[0] if output else None
+    return _probe(
+        _STATUS_AVAILABLE if completed.returncode == 0 else "failed",
+        "subprocess",
+        {"command": list(command), "executable": executable, "version": first_line, "exit_code": completed.returncode},
+    )
+
+
+def _toolchains() -> list[dict[str, Any]]:
+    # Commands are fixed, short version queries only; no shell, discovery scan,
+    # package installation, or project-specific build invocation occurs.
+    commands = (
+        ("python", (sys.executable, "--version")),
+        ("gcc", ("gcc", "--version")),
+        ("clang", ("clang", "--version")),
+        ("msvc-cl", ("cl",)),
+        ("go", ("go", "version")),
+        ("rustc", ("rustc", "--version")),
+        ("cargo", ("cargo", "--version")),
+        ("dotnet", ("dotnet", "--version")),
+        ("java", ("java", "-version")),
+        ("node", ("node", "--version")),
+        ("npm", ("npm", "--version")),
+        ("cmake", ("cmake", "--version")),
+        ("ninja", ("ninja", "--version")),
+        ("make", ("make", "--version")),
+        ("pip", ("pip", "--version")),
+        ("winget", ("winget", "--version")),
+        ("choco", ("choco", "--version")),
+        ("brew", ("brew", "--version")),
+        ("apt", ("apt", "--version")),
+    )
+    return [{"name": name, **_command_version(command)} for name, command in commands]
+
+
+def _linux_runtime_context() -> dict[str, Any]:
+    release = platform.release().casefold()
+    cgroup = _read_optional(Path("/proc/self/cgroup"))
+    cgroup_text = (cgroup or "").casefold()
+    container_markers = ("docker", "containerd", "kubepods", "podman", "lxc", "libpod")
+    container = Path("/.dockerenv").exists() or any(marker in cgroup_text for marker in container_markers)
+    cpu_max = _read_optional(Path("/sys/fs/cgroup/cpu.max"))
+    cpu_limit: float | None = None
+    if cpu_max and cpu_max != "max":
+        try:
+            quota, period = cpu_max.split()[:2]
+            cpu_limit = int(quota) / int(period)
+        except (ValueError, ZeroDivisionError):
+            pass
+    memory_max_text = _read_optional(Path("/sys/fs/cgroup/memory.max"))
+    try:
+        memory_limit = None if memory_max_text in (None, "max") else int(memory_max_text)
+    except ValueError:
+        memory_limit = None
+    affinity: list[int] | None
+    try:
+        affinity = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        affinity = None
+    virtual = "hypervisor" in ((_read_optional(Path("/proc/cpuinfo")) or "").casefold())
+    remote = bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"))
+    return {
+        "container": _probe(_STATUS_AVAILABLE, "/.dockerenv,/proc/self/cgroup", container),
+        "wsl": _probe(_STATUS_AVAILABLE, "platform.release", "microsoft" in release or "wsl" in release),
+        "virtual_machine": _probe(_STATUS_AVAILABLE, "/proc/cpuinfo", virtual, "A false value only means the kernel did not expose the hypervisor CPU flag."),
+        "remote_session": _probe(_STATUS_AVAILABLE, "SSH_CONNECTION,SSH_TTY", remote),
+        "effective_limits": _probe(
+            _STATUS_AVAILABLE,
+            "/sys/fs/cgroup,/proc/self/status,os.sched_getaffinity",
+            {"cgroup_version": 2 if Path("/sys/fs/cgroup/cgroup.controllers").exists() else None, "cpu_quota_cores": cpu_limit, "memory_limit_bytes": memory_limit, "allowed_cpu_ids": affinity},
+        ),
+    }
+
+
+def _windows_runtime_context() -> dict[str, Any]:
+    session = os.environ.get("SESSIONNAME", "")
+    remote = session.upper().startswith("RDP-") or bool(os.environ.get("SSH_CONNECTION"))
+    status, system, detail = _powershell_json(
+        "Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer,Model,HypervisorPresent | ConvertTo-Json -Compress"
+    )
+    virtual = None
+    if status == _STATUS_AVAILABLE and isinstance(system, dict):
+        manufacturer = str(system.get("Manufacturer") or "").casefold()
+        model = str(system.get("Model") or "").casefold()
+        virtual = bool(system.get("HypervisorPresent")) or any(token in manufacturer + " " + model for token in ("virtual", "vmware", "qemu", "xen", "kvm"))
+    # WSL only runs a Linux kernel, but retain this explicit platform result so
+    # a consumer never has to infer it from an absent Linux field.
+    job_probe = _windows_job_limits()
+    return {
+        "container": _windows_container_context(),
+        "wsl": _probe(_STATUS_AVAILABLE, "sys.platform", False),
+        "virtual_machine": _probe(status, "PowerShell Win32_ComputerSystem", virtual, detail),
+        "remote_session": _probe(_STATUS_AVAILABLE, "SESSIONNAME,SSH_CONNECTION", remote),
+        "effective_limits": job_probe,
+        "job_object": job_probe,
+    }
+
+
+def _windows_container_context() -> dict[str, Any]:
+    """Report explicit Windows-container markers without treating a Job as proof."""
+    markers = [name for name in ("CONTAINER_SANDBOX_MOUNT_POINT", "CONTAINER_ID", "DOTNET_RUNNING_IN_CONTAINER", "KUBERNETES_SERVICE_HOST") if os.environ.get(name)]
+    registry_value: Any = None
+    registry_error: str | None = None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control") as key:
+            registry_value, _ = winreg.QueryValueEx(key, "ContainerType")
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        registry_error = type(error).__name__
+    detected = bool(markers or registry_value)
+    details = {"detected": detected, "environment_markers": markers, "container_type": registry_value}
+    note = "No explicit Windows-container marker was found; this does not rule out every isolation mechanism." if not detected else None
+    if registry_error:
+        note = (note + " " if note else "") + "Container registry probe failed: %s." % registry_error
+    return _probe(_STATUS_AVAILABLE, "environment,HKLM SYSTEM\\CurrentControlSet\\Control\\ContainerType", details, note)
+
+
+def _windows_job_limits() -> dict[str, Any]:
+    """Read current Windows Job Object membership and enforceable limits.
+
+    A job is not automatically a container, but its limits govern a process in
+    common local sandboxes, CI runners, and Windows-container hosts.
+    """
+    empty = {"in_job": None, "limit_flags": None, "active_process_limit": None,
+             "process_memory_limit_bytes": None, "job_memory_limit_bytes": None,
+             "cpu_time_limit_100ns": {"per_process": None, "per_job": None},
+             "affinity_mask": None}
+    try:
+        class LargeInteger(ctypes.Structure):
+            _fields_ = [("quad_part", ctypes.c_longlong)]
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in ("read_operation_count", "write_operation_count", "other_operation_count", "read_transfer_count", "write_transfer_count", "other_transfer_count")]
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("per_process_user_time_limit", LargeInteger), ("per_job_user_time_limit", LargeInteger),
+                ("limit_flags", ctypes.c_uint32), ("minimum_working_set_size", ctypes.c_size_t),
+                ("maximum_working_set_size", ctypes.c_size_t), ("active_process_limit", ctypes.c_uint32),
+                ("affinity", ctypes.c_size_t), ("priority_class", ctypes.c_uint32), ("scheduling_class", ctypes.c_uint32),
+            ]
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [("basic_limit_information", BasicLimitInformation), ("io_info", IoCounters),
+                        ("process_memory_limit", ctypes.c_size_t), ("job_memory_limit", ctypes.c_size_t),
+                        ("peak_process_memory_used", ctypes.c_size_t), ("peak_job_memory_used", ctypes.c_size_t)]
+        kernel32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
+        is_in_job = kernel32.IsProcessInJob
+        is_in_job.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        is_in_job.restype = ctypes.c_int
+        current = kernel32.GetCurrentProcess()
+        member = ctypes.c_int()
+        if not is_in_job(current, None, ctypes.byref(member)):
+            return _probe("failed", "kernel32.IsProcessInJob", empty, "Win32 error %d" % ctypes.get_last_error())
+        values = dict(empty)
+        values["in_job"] = bool(member.value)
+        if not member.value:
+            return _probe(_STATUS_AVAILABLE, "kernel32.IsProcessInJob", values, "The current process is not assigned to a Job Object.")
+        query = kernel32.QueryInformationJobObject
+        query.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+        query.restype = ctypes.c_int
+        info = ExtendedLimitInformation()
+        if not query(None, 9, ctypes.byref(info), ctypes.sizeof(info), None):  # JobObjectExtendedLimitInformation
+            return _probe("failed", "kernel32.QueryInformationJobObject", values, "Win32 error %d" % ctypes.get_last_error())
+        flags = info.basic_limit_information.limit_flags
+        values.update({
+            "limit_flags": "0x%08X" % flags,
+            "active_process_limit": info.basic_limit_information.active_process_limit if flags & 0x00000008 else None,
+            "process_memory_limit_bytes": info.process_memory_limit if flags & 0x00000100 else None,
+            "job_memory_limit_bytes": info.job_memory_limit if flags & 0x00000200 else None,
+            "cpu_time_limit_100ns": {
+                "per_process": info.basic_limit_information.per_process_user_time_limit.quad_part if flags & 0x00000002 else None,
+                "per_job": info.basic_limit_information.per_job_user_time_limit.quad_part if flags & 0x00000004 else None,
+            },
+            "affinity_mask": "0x%X" % info.basic_limit_information.affinity if flags & 0x00000010 else None,
+        })
+        return _probe(_STATUS_AVAILABLE, "kernel32.IsProcessInJob/QueryInformationJobObject", values)
+    except (AttributeError, OSError, ValueError) as error:
+        return _probe("failed", "kernel32 Job Object API", empty, type(error).__name__)
+
+
+def _macos_runtime_context() -> dict[str, Any]:
+    remote = bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"))
+    return {
+        "container": _probe(_STATUS_UNSUPPORTED, "macOS", None, "macOS does not expose Linux cgroup container evidence."),
+        "wsl": _probe(_STATUS_AVAILABLE, "sys.platform", False),
+        "virtual_machine": _probe(_STATUS_UNKNOWN, "portable stdlib", None, "No native hypervisor query was run."),
+        "remote_session": _probe(_STATUS_AVAILABLE, "SSH_CONNECTION,SSH_TTY", remote),
+        "effective_limits": _probe(_STATUS_UNKNOWN, "portable stdlib", {"cgroup_version": None, "cpu_quota_cores": None, "memory_limit_bytes": None, "allowed_cpu_ids": None}),
+    }
+
+
+def _runtime_context() -> dict[str, Any]:
+    if sys.platform.startswith("linux"):
+        return _linux_runtime_context()
+    if sys.platform == "win32":
+        return _windows_runtime_context()
+    if sys.platform == "darwin":
+        return _macos_runtime_context()
+    return {"status": _STATUS_UNSUPPORTED, "source": "sys.platform", "detail": "No runtime-isolation probes are implemented for this platform."}
+
+
+def _linux_cpu_suitability(cpu: dict[str, Any]) -> dict[str, Any]:
+    numa_nodes = []
+    for node in sorted(Path("/sys/devices/system/node").glob("node[0-9]*")):
+        numa_nodes.append({"node": node.name, "cpu_list": _read_optional(node / "cpulist")})
+    policy_roots = sorted(Path("/sys/devices/system/cpu/cpufreq").glob("policy*"))
+    governors = sorted({value for root in policy_roots if (value := _read_optional(root / "scaling_governor"))})
+    drivers = sorted({value for root in policy_roots if (value := _read_optional(root / "scaling_driver"))})
+    flags = cpu.get("instruction_sets") or []
+    return {
+        "numa": _probe(_STATUS_AVAILABLE, "/sys/devices/system/node", {"node_count": len(numa_nodes), "nodes": numa_nodes}),
+        "power_and_performance": _probe(_STATUS_AVAILABLE, "/sys/devices/system/cpu/cpufreq", {"governors": governors, "drivers": drivers, "intel_pstate_status": _read_optional(Path("/sys/devices/system/cpu/intel_pstate/status"))}),
+        "virtualization": _probe(_STATUS_AVAILABLE, "/proc/cpuinfo", {"hypervisor_present": "hypervisor" in flags, "hardware_extensions": sorted(set(flags) & {"vmx", "svm"})}),
+        "os_enabled_instruction_sets": _probe(_STATUS_AVAILABLE, "/proc/cpuinfo", sorted(flags), "These are flags exposed by the running kernel; this is not a workload test."),
+    }
+
+
+def _generic_cpu_suitability(cpu: dict[str, Any]) -> dict[str, Any]:
+    flags = cpu.get("instruction_sets") or []
+    return {
+        "numa": _probe(_STATUS_UNKNOWN, "portable stdlib", {"node_count": None, "nodes": []}),
+        "power_and_performance": _probe(_STATUS_UNKNOWN, "portable stdlib", {"governors": [], "drivers": []}),
+        "virtualization": _probe(_STATUS_UNKNOWN, "portable stdlib", {"hypervisor_present": None, "hardware_extensions": []}),
+        "os_enabled_instruction_sets": _probe(_STATUS_AVAILABLE if flags else _STATUS_UNKNOWN, "platform CPU probe", sorted(flags), "Processor flags alone do not prove every instruction is usable by an application."),
+    }
+
+
+def _powershell_json(script: str) -> tuple[str, Any, str | None]:
+    executable = shutil.which("powershell") or shutil.which("pwsh")
+    if not executable:
+        return _STATUS_UNAVAILABLE, None, "PowerShell was not found on PATH."
+    try:
+        completed = subprocess.run((executable, "-NoProfile", "-NonInteractive", "-Command", script), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8, check=False)
+    except subprocess.TimeoutExpired:
+        return "failed", None, "PowerShell timed out after 8 seconds."
+    except OSError as error:
+        return "failed", None, str(error)
+    if completed.returncode != 0:
+        return "failed", None, (completed.stderr or "PowerShell probe failed.").strip()
+    try:
+        return _STATUS_AVAILABLE, json.loads(completed.stdout), None
+    except json.JSONDecodeError as error:
+        return "failed", None, "PowerShell returned invalid JSON: %s" % error
+
+
+def _windows_cpu_suitability(cpu: dict[str, Any]) -> dict[str, Any]:
+    status, data, detail = _powershell_json(
+        "[ordered]@{processors=@(Get-CimInstance Win32_Processor | Select-Object DeviceID,NumberOfCores,NumberOfLogicalProcessors,VirtualizationFirmwareEnabled,VMMonitorModeExtensions); "
+        "computer=Get-CimInstance Win32_ComputerSystem | Select-Object HypervisorPresent,NumberOfLogicalProcessors} | ConvertTo-Json -Depth 3 -Compress"
+    )
+    processors = data.get("processors") if status == _STATUS_AVAILABLE and isinstance(data, dict) else []
+    if isinstance(processors, dict):
+        processors = [processors]
+    computer = data.get("computer") if status == _STATUS_AVAILABLE and isinstance(data, dict) else {}
+    virtualization = {
+        "hypervisor_present": computer.get("HypervisorPresent") if isinstance(computer, dict) else None,
+        "firmware_enabled": any(item.get("VirtualizationFirmwareEnabled") for item in processors if isinstance(item, dict)),
+        "hardware_extensions": ["vm_monitor_mode_extensions"] if any(item.get("VMMonitorModeExtensions") for item in processors if isinstance(item, dict)) else [],
+    }
+    power = _command_version(("powercfg", "/getactivescheme"))
+    flags = cpu.get("instruction_sets") or []
+    return {
+        "numa": _windows_numa_topology(),
+        "power_and_performance": _probe(power["status"], power["source"], {"active_power_scheme": power["value"].get("version") if isinstance(power.get("value"), dict) else None}),
+        "virtualization": _probe(status, "PowerShell Win32_Processor,Win32_ComputerSystem", virtualization, detail),
+        "os_enabled_instruction_sets": _probe(_STATUS_AVAILABLE if flags else _STATUS_UNKNOWN, "CPUID and IsProcessorFeaturePresent", sorted(flags), "CPUID advertises processor capabilities; application availability can still be constrained by OS policy."),
+    }
+
+
+def _windows_numa_topology() -> dict[str, Any]:
+    """Report Windows NUMA nodes and processor groups through kernel32."""
+    empty = {"node_count": None, "nodes": []}
+    try:
+        class GroupAffinity(ctypes.Structure):
+            _fields_ = [("mask", ctypes.c_size_t), ("group", ctypes.c_uint16), ("reserved", ctypes.c_uint16 * 3)]
+        kernel32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
+        highest = ctypes.c_ulong()
+        get_highest = kernel32.GetNumaHighestNodeNumber
+        get_highest.argtypes = [ctypes.POINTER(ctypes.c_ulong)]
+        get_highest.restype = ctypes.c_int
+        if not get_highest(ctypes.byref(highest)):
+            return _probe("failed", "kernel32.GetNumaHighestNodeNumber", empty, "Win32 error %d" % ctypes.get_last_error())
+        get_mask = getattr(kernel32, "GetNumaNodeProcessorMaskEx", None)
+        nodes: list[dict[str, Any]] = []
+        if get_mask is not None:
+            get_mask.argtypes = [ctypes.c_uint16, ctypes.POINTER(GroupAffinity)]
+            get_mask.restype = ctypes.c_int
+            for node_number in range(highest.value + 1):
+                affinity = GroupAffinity()
+                if not get_mask(node_number, ctypes.byref(affinity)):
+                    nodes.append({"node": node_number, "status": "unavailable", "win32_error": ctypes.get_last_error()})
+                    continue
+                processors = [bit for bit in range(ctypes.sizeof(ctypes.c_size_t) * 8) if affinity.mask & (1 << bit)]
+                nodes.append({"node": node_number, "status": "available", "processor_group": affinity.group, "logical_processor_bits": processors, "mask": "0x%X" % affinity.mask})
+            return _probe(_STATUS_AVAILABLE, "kernel32.GetNumaHighestNodeNumber/GetNumaNodeProcessorMaskEx", {"node_count": highest.value + 1, "nodes": nodes}, "Processor bit positions are relative to each Windows processor group.")
+        # Legacy fallback covers hosts with up to one processor group.
+        get_legacy = kernel32.GetNumaNodeProcessorMask
+        get_legacy.argtypes = [ctypes.c_ubyte, ctypes.POINTER(ctypes.c_size_t)]
+        get_legacy.restype = ctypes.c_int
+        for node_number in range(highest.value + 1):
+            mask = ctypes.c_size_t()
+            if get_legacy(node_number, ctypes.byref(mask)):
+                nodes.append({"node": node_number, "status": "available", "processor_group": 0, "logical_processor_bits": [bit for bit in range(ctypes.sizeof(ctypes.c_size_t) * 8) if mask.value & (1 << bit)], "mask": "0x%X" % mask.value})
+            else:
+                nodes.append({"node": node_number, "status": "unavailable", "win32_error": ctypes.get_last_error()})
+        return _probe(_STATUS_AVAILABLE, "kernel32.GetNumaHighestNodeNumber/GetNumaNodeProcessorMask", {"node_count": highest.value + 1, "nodes": nodes}, "Legacy processor masks do not represent processor groups above 64 logical processors.")
+    except (AttributeError, OSError, ValueError) as error:
+        return _probe("failed", "kernel32 NUMA API", empty, type(error).__name__)
+
+
+def _network_details() -> dict[str, Any]:
+    if sys.platform.startswith("linux"):
+        executable = shutil.which("ip")
+        if not executable:
+            return _probe(_STATUS_UNAVAILABLE, "PATH", {"interfaces": [], "default_routes": [], "dns_servers": []}, "The optional ip command was not found.")
+        try:
+            addresses = subprocess.run((executable, "-j", "address"), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4, check=False)
+            routes = subprocess.run((executable, "-j", "route", "show", "default"), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4, check=False)
+            interfaces = json.loads(addresses.stdout) if addresses.returncode == 0 else []
+            default_routes = json.loads(routes.stdout) if routes.returncode == 0 else []
+            simplified = [
+                {"name": item.get("ifname"), "state": item.get("operstate"), "mac_address": item.get("address"), "addresses": [address.get("local") for address in item.get("addr_info", []) if address.get("local")]}
+                for item in interfaces if item.get("ifname") != "lo"
+            ]
+            dns = [line.split(None, 1)[1] for line in (_read_optional(Path("/etc/resolv.conf")) or "").splitlines() if line.startswith("nameserver ")]
+            return _probe(_STATUS_AVAILABLE, "ip -j address; ip -j route show default; /etc/resolv.conf", {"interfaces": simplified, "default_routes": default_routes, "dns_servers": dns})
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+            return _probe("failed", "ip", {"interfaces": [], "default_routes": [], "dns_servers": []}, str(error))
+    if sys.platform == "win32":
+        status, data, detail = _powershell_json(
+            "[ordered]@{interfaces=@(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | "
+            "Select-Object Description,MACAddress,IPAddress,IPSubnet,DefaultIPGateway,DNSServerSearchOrder,InterfaceIndex); "
+            "routes=@(Get-CimInstance Win32_IP4RouteTable -Filter 'Destination=\"0.0.0.0\"' | "
+            "Select-Object InterfaceIndex,NextHop,Metric1,Destination,Mask)} | ConvertTo-Json -Depth 4 -Compress"
+        )
+        if status != _STATUS_AVAILABLE:
+            return _probe(status, "PowerShell CIM", {"interfaces": [], "default_routes": [], "dns_servers": []}, detail)
+        interfaces = data.get("interfaces") or []
+        if isinstance(interfaces, dict):
+            interfaces = [interfaces]
+        routes = data.get("routes") or []
+        if isinstance(routes, dict):
+            routes = [routes]
+        simplified = []
+        dns_servers: set[str] = set()
+        for item in interfaces:
+            dns = item.get("DNSServerSearchOrder") or []
+            if isinstance(dns, str):
+                dns = [dns]
+            dns_servers.update(dns)
+            addresses = item.get("IPAddress") or []
+            if isinstance(addresses, str):
+                addresses = [addresses]
+            simplified.append({"name": item.get("Description"), "mac_address": item.get("MACAddress"), "addresses": addresses, "default_gateways": item.get("DefaultIPGateway") or [], "interface_index": item.get("InterfaceIndex")})
+        return _probe(_STATUS_AVAILABLE, "PowerShell Win32_NetworkAdapterConfiguration,Win32_IP4RouteTable", {"interfaces": simplified, "default_routes": routes, "dns_servers": sorted(dns_servers)})
+    return _probe(_STATUS_UNSUPPORTED, "sys.platform", {"interfaces": [], "default_routes": [], "dns_servers": []}, "Rich network routing probes are currently implemented for Linux only.")
+
+
+def _display_details() -> dict[str, Any]:
+    if sys.platform.startswith("linux"):
+        connectors = []
+        for connector in sorted(Path("/sys/class/drm").glob("card*-*")):
+            status = _read_optional(connector / "status")
+            if status:
+                modes = (_read_optional(connector / "modes") or "").splitlines()
+                connectors.append({"connector": connector.name, "status": status, "modes": modes})
+        if connectors:
+            return _probe(_STATUS_AVAILABLE, "/sys/class/drm", connectors)
+        return _probe(_STATUS_UNAVAILABLE, "/sys/class/drm", [], "No DRM connector information is visible (common on headless systems).")
+    if sys.platform == "win32":
+        status, data, detail = _powershell_json(
+            "@(Get-CimInstance Win32_DesktopMonitor | Select-Object Name,ScreenWidth,ScreenHeight,MonitorType,PNPDeviceID; "
+            "Get-CimInstance Win32_VideoController | Select-Object Name,VideoModeDescription,CurrentHorizontalResolution,CurrentVerticalResolution,CurrentRefreshRate) "
+            "| ConvertTo-Json -Depth 3 -Compress"
+        )
+        if status != _STATUS_AVAILABLE:
+            return _probe(status, "PowerShell CIM", [], detail)
+        records = data if isinstance(data, list) else [data]
+        return _probe(_STATUS_AVAILABLE, "PowerShell Win32_DesktopMonitor,Win32_VideoController", records)
+    return _probe(_STATUS_UNSUPPORTED, "sys.platform", [], "Detailed connector enumeration is currently implemented for Linux only.")
+
+
+def collect_developer_context(report_sections: dict[str, Any]) -> dict[str, Any]:
+    """Collect opt-in build, runtime, CPU, display, and network diagnostics."""
+    result: dict[str, Any] = {
+        "status": _STATUS_AVAILABLE,
+        "provenance": {"collector": "machine_info.py", "mode": "fixed local read-only probes"},
+        "runtime": _runtime_context(),
+        "toolchains": _toolchains(),
+    }
+    if "cpu" in report_sections:
+        cpu = report_sections["cpu"].get("cpu", {})
+        if sys.platform.startswith("linux"):
+            result["cpu_suitability"] = _linux_cpu_suitability(cpu)
+        elif sys.platform == "win32":
+            result["cpu_suitability"] = _windows_cpu_suitability(cpu)
+        else:
+            result["cpu_suitability"] = _generic_cpu_suitability(cpu)
+    else:
+        result["cpu_suitability"] = {"status": "not_collected", "source": "--sections", "detail": "Select the cpu section to collect CPU suitability."}
+    result["network"] = _network_details() if "system" in report_sections or "hardware" in report_sections else {"status": "not_collected", "source": "--sections", "detail": "Select system or hardware to collect network details."}
+    result["display"] = _display_details() if "hardware" in report_sections else {"status": "not_collected", "source": "--sections", "detail": "Select the hardware section to collect display details."}
+    return result
+
+
 
 SCHEMA_VERSION = 1
 SECTION_NAMES = ("system", "hardware", "cpu")
@@ -903,6 +1565,7 @@ def collect_machine_info(
     include_environment: bool = False,
     include_usage: bool = True,
     interval: float = DEFAULT_INTERVAL_SECONDS,
+    include_developer_context: bool = False,
 ) -> dict[str, Any]:
     """Return the facade's stable report while delegating all probes to siblings."""
     report_sections: dict[str, Any] = {}
@@ -913,7 +1576,7 @@ def collect_machine_info(
     if "cpu" in sections:
         report_sections["cpu"] = collect_cpu_info(interval, include_usage)
 
-    return {
+    report = {
         "schema_version": SCHEMA_VERSION,
         "platform": {
             "operating_system": platform.system(),
@@ -922,6 +1585,46 @@ def collect_machine_info(
         },
         "selected_sections": list(sections),
         "sections": report_sections,
+    }
+    if include_developer_context:
+        report["developer_context"] = collect_developer_context(report_sections)
+    return report
+
+
+def _machine_summary(report: dict[str, Any]) -> dict[str, Any]:
+    """Bound the LLM view to decisions, counts, and evidence availability."""
+    sections = report.get("sections", {})
+    system = sections.get("system", {})
+    cpu = sections.get("cpu", {}).get("cpu", {})
+    hardware = sections.get("hardware", {}).get("hardware", {})
+    context = report.get("developer_context") or {}
+    toolchains = context.get("toolchains", [])
+    available_tools = [item.get("name") for item in toolchains if item.get("status") == _STATUS_AVAILABLE]
+    return {
+        "status": _STATUS_AVAILABLE,
+        "platform": report.get("platform"),
+        "selected_sections": report.get("selected_sections", []),
+        "system": {
+            "distribution": system.get("operating_system", {}).get("distribution", {}).get("pretty_name"),
+            "memory_total_bytes": system.get("resources", {}).get("memory", {}).get("total_bytes"),
+        },
+        "cpu": {
+            "name": cpu.get("name"),
+            "physical_cores": cpu.get("physical_cores"),
+            "logical_cores": cpu.get("logical_cores"),
+            "instruction_set_count": len(cpu.get("instruction_sets", [])),
+        },
+        "hardware": {
+            "graphics_adapter_count": len(hardware.get("graphics", [])),
+            "display_count": len(hardware.get("displays", [])),
+            "network_adapter_count": len(hardware.get("network", [])),
+        },
+        "developer_context": {
+            "included": bool(context),
+            "toolchains_available": available_tools,
+            "runtime": context.get("runtime"),
+            "cpu_suitability": context.get("cpu_suitability"),
+        },
     }
 
 
@@ -1000,6 +1703,11 @@ def main() -> int:
         action="store_true",
         help="include system environment values; credential-like names remain redacted",
     )
+    parser.add_argument(
+        "--developer-context",
+        action="store_true",
+        help="add opt-in runtime limits, fixed toolchain version probes, CPU suitability, and richer network/display evidence",
+    )
     parser.add_argument("--no-usage", action="store_true", help="skip the CPU utilization sample")
     parser.add_argument(
         "--interval",
@@ -1008,7 +1716,14 @@ def main() -> int:
         metavar="SECONDS",
         help=f"CPU usage sample duration; default: {DEFAULT_INTERVAL_SECONDS:g}; must be non-negative",
     )
+    add_common_arguments(parser)
     args = parser.parse_args()
+    if args.output_schema:
+        print(json.dumps(requirements_schema(), indent=2, sort_keys=True, allow_nan=False))
+        return 0
+    if args.report_schema:
+        print(json.dumps(report_schema(), indent=2, sort_keys=True, allow_nan=False))
+        return 0
     selected_sections = _parse_sections(args.sections, parser)
 
     if args.include_environment and "system" not in selected_sections:
@@ -1028,7 +1743,9 @@ def main() -> int:
         include_environment=args.include_environment,
         include_usage=not args.no_usage,
         interval=interval,
+        include_developer_context=args.developer_context,
     )
+    report = finalize_report(report, args, "machine_info", _machine_summary)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True, default=str, allow_nan=False))
     else:

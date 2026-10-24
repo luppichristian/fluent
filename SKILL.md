@@ -1,47 +1,70 @@
 ---
 name: fluent
-description: Develop professional C projects, including targeted CUDA, shader, and assembly work.
+description: Use for any work on C projects, including CUDA, GLSL/HLSL shaders, and assembly: writing code, debugging, testing, architecture, builds, releases, and project planning.
 ---
 
 # fluent
 
-Protocols for professional C projects, including targeted CUDA, GLSL/HLSL, and assembly work. 
-The user is the product manager or technical lead.
-
-## Areas
-
-- Implementation: code, patterns, conventions, and style.
-- Project design: structure and boundaries.
-- Architecture: system design in code.
-- Debugging and testing: unit, integration, end-to-end, and coverage where useful.
-- Distribution: supported platforms and release work.
-- Project management: planning, scope, status, and delivery.
+You are working on a professional C project. The user is the product manager or technical lead.
 
 ## Resources
 
-- [tasks](tasks/): reusable procedures; check for matching tasks in the user's request and apply instructions.
+Load [JUMP.md](JUMP.md), it contains different types of resources:
+- [procs](procs/): reusable procedures; they reference rules.
 - [rules](rules/): focused rules and protocols; read only what applies.
 - [subagents](subagents/): specific prompts for spawning subagents.
 - [scripts](scripts/): generic, reusable crossplatform scripts and tooling.
 
-Load [JUMP.md](JUMP.md) and use it to find resources by name and description, then open only the relevant resources.
+Use it to find the resources you need, then open only the relevant `.md` files.
 
-## Working standard
+## Workflow
 
 For every non-trivial user request:
-1. Make a plan proportional to the request.
-2. Split the work into independent tasks whenever it can be split safely.
-3. Assign each task to an implementation subagent. Give every task a clear goal, scope, and acceptance criteria. Keep file ownership separate where possible to avoid conflicts.
-4. Assign separate quality-manager subagents to verify each completed task and the integrated result independently.
-5. If QA finds a defect or an unmet requirement, return the task to its implementation subagent with the QA evidence. Run QA again after the fix.
-6. Mark work complete only after QA approves it.
+1. Write a plan: goal, steps, files touched, optimal subagent delegation.
+2. Split the plan into independent tasks. 
+3. Give each task a goal, a scope, acceptance criteria, and its own files.
+4. Spawn each subagent with it's relative task.
+5. When a task is done, give it to a separate QA subagent. QA checks it against the acceptance criteria.
+6. If QA finds a problem, send it back to the implementation subagent with QA's evidence. Then run QA again.
+7. Mark a task complete only after QA approves. After all tasks pass, run QA once more on the combined result.
 
-Implementation subagents perform their assigned tasks. Subagents may spawn other subagents. Tasks may generate subagents.
+## Reporting
 
-Aim for production-ready work unless the user requests a smaller or temporary result. Be precise about what is complete, what remains, known limitations, temporary measures, and whether validation occurred. Do not hide uncertainty or describe unverified work as complete.
+- Be precise about what is complete, what remains, known limitations, temporary measures, and whether validation occurred. 
+- Do not hide uncertainty or describe unverified work as complete.
 
-Work always needs to be audited and tested.
+## Keep the project clean
+
+- Minimal changes are always preferred.
+- Edit an existing file instead of creating a new one.
+- Delete unused and duplicate files.
+- Follow the existing folder layout and naming.
+
+## Project stage
+
+Check the project stage and follow it:
+
+| Stage | What to do |
+|---|---|
+| Early Development | Keep it simple. Get to a first working build. |
+| Deep Development | Prioritize quality and performance. |
+| Closed Release | Start versioning. Big changes are still allowed. |
+| Public Release | Use strict versioning. Be careful with big changes. |
+
+Before Public Release, ignore backwards compatibility.
 
 ## Skill growth
 
-When work produces a proven, likely-reusable asset, update this skill as part of the work: operations go in `scripts/`, procedures in `tasks/`, durable rules in `rules/`, and delegation patterns in `subagents/`. Add its description metadata and manually update its entry in `JUMP.md`. Search first and extend a compatible resource rather than duplicating it; create a focused file only when it has distinct future value. Do not save task-specific details or speculation. Preserve callers and validate changed scripts.
+When your work produces a reusable resource that is proven to work:
+1. Search the existing resources first. If one fits, extend it. Otherwise create one new file.
+2. Put it in the right folder: `scripts/`, `tasks/`, `rules/`, `subagents/`.
+3. Add name and description metadata to the file, then add its entry to `JUMP.md` by hand.
+4. Test any script you changed.
+
+Do not save task-specific details or guesses. Keep the number of resources small, because every entry in `JUMP.md` uses context.
+
+## Remember
+
+Plan, delegate, verify with QA, report honestly.
+
+Always try to satisfy the user's request in the most complete and optimal way.
