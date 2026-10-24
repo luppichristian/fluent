@@ -8,7 +8,7 @@
 
 ## scripts
 
-- [scripts/audio_info.md](scripts/audio_info.md): Inspect the local OpenAL runtime, its output devices, extensions, and default-device capabilities.
+- [scripts/audio_info.md](scripts/audio_info.md): Inspect OpenAL plus passive operating-system playback and capture endpoint inventories.
 - [scripts/gpu_info.md](scripts/gpu_info.md): Read-only GPU inventory plus vendor-feature evidence and graphics/compute API diagnostics.
 - [scripts/machine_info.md](scripts/machine_info.md): Read-only report of system, hardware, and CPU capabilities.
 
@@ -16,6 +16,6 @@
 
 - [subagents/example.md](subagents/example.md): Template for reusable implementation or QA subagent prompts.
 
-## tasks
+## procs
 
-- [tasks/example.md](tasks/example.md): Template for reusable development task procedures.
+- [procs/example.md](procs/example.md): Template for reusable development task procedures.
