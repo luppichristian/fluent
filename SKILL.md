@@ -1,6 +1,6 @@
 ---
 name: fluent
-description: Use for any work on C projects, including CUDA, GLSL/HLSL shaders, and assembly: writing code, debugging, testing, architecture, builds, releases, and project planning.
+description: Use for any work on programming projects. Covers writing code, debugging, testing, architecture, builds, releases, and project planning.
 ---
 
 # fluent

@@ -39,8 +39,7 @@ def description(path: Path) -> str | None:
 def render() -> tuple[str, list[Path]]:
     missing: list[Path] = []
     lines = [
-        "# fluent resource index", "",
-        "<!-- Maintained manually; verified by .github/workflows/gen_jump_file.py. -->", "",
+        "",
     ]
     for name in RESOURCE_DIRS:
         directory = ROOT / name
