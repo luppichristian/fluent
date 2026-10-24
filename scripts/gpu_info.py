@@ -9,6 +9,7 @@ symbols are namespaced per collector so optional probes remain independent.
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import ctypes
 import ctypes.util
@@ -876,7 +877,82 @@ def _direct3d_release_com(pointer: Any) -> None:
         pass
 
 
-def _direct3d_d3d11_device_probe() -> dict[str, Any]:
+class _Direct3dGuid(ctypes.Structure):
+    _fields_ = [('data1', ctypes.c_uint32), ('data2', ctypes.c_uint16), ('data3', ctypes.c_uint16), ('data4', ctypes.c_ubyte * 8)]
+
+
+class _Direct3dAdapterDesc1(ctypes.Structure):
+    _fields_ = [
+        ('description', ctypes.c_wchar * 128), ('vendor_id', ctypes.c_uint),
+        ('device_id', ctypes.c_uint), ('subsystem_id', ctypes.c_uint),
+        ('revision', ctypes.c_uint), ('dedicated_video_memory', ctypes.c_size_t),
+        ('dedicated_system_memory', ctypes.c_size_t), ('shared_system_memory', ctypes.c_size_t),
+        ('adapter_luid_low', ctypes.c_uint32), ('adapter_luid_high', ctypes.c_int32),
+        ('flags', ctypes.c_uint),
+    ]
+
+
+def _direct3d_dxgi_adapters() -> tuple[list[tuple[Any, dict[str, Any]]], dict[str, Any]]:
+    """Enumerate IDXGIAdapter1 objects for opt-in, per-adapter probes only."""
+    summary: dict[str, Any] = {
+        'requested': True, 'status': 'not_applicable' if sys.platform != 'win32' else 'unavailable',
+        'provenance': 'CreateDXGIFactory1 / IDXGIFactory1::EnumAdapters1 / IDXGIAdapter1::GetDesc1',
+        'error': None,
+    }
+    if sys.platform != 'win32':
+        return [], summary
+    factory = ctypes.c_void_p()
+    adapters: list[tuple[Any, dict[str, Any]]] = []
+    try:
+        dxgi = ctypes.WinDLL('dxgi.dll')
+        create = dxgi.CreateDXGIFactory1
+        create.argtypes = [ctypes.POINTER(_Direct3dGuid), ctypes.POINTER(ctypes.c_void_p)]
+        create.restype = ctypes.c_long
+        iid = _Direct3dGuid(0x770AAE78, 0xF26F, 0x4DBA, (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87))
+        hresult = create(ctypes.byref(iid), ctypes.byref(factory))
+        summary['hresult'] = '0x%08X' % (hresult & 0xffffffff)
+        if hresult < 0 or not factory.value:
+            summary['error'] = 'CreateDXGIFactory1 failed'
+            return [], summary
+        vtable = ctypes.cast(factory, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        enum_adapters = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))(vtable[12])
+        index = 0
+        while True:
+            adapter = ctypes.c_void_p()
+            status = enum_adapters(factory, index, ctypes.byref(adapter))
+            if status < 0 or not adapter.value:
+                break
+            try:
+                adapter_vtable = ctypes.cast(adapter, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+                get_desc = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(_Direct3dAdapterDesc1))(adapter_vtable[10])
+                description = _Direct3dAdapterDesc1()
+                desc_hr = get_desc(adapter, ctypes.byref(description))
+                identity = {
+                    'dxgi_index': index, 'name': description.description or None,
+                    'vendor_id': '0x%04X' % description.vendor_id, 'device_id': '0x%04X' % description.device_id,
+                    'subsystem_id': '0x%08X' % description.subsystem_id, 'revision': description.revision,
+                    'dedicated_video_memory_bytes': description.dedicated_video_memory,
+                    'dedicated_system_memory_bytes': description.dedicated_system_memory,
+                    'shared_system_memory_bytes': description.shared_system_memory,
+                    'luid': '%08X:%08X' % (description.adapter_luid_high & 0xffffffff, description.adapter_luid_low),
+                    'software': bool(description.flags & 2), 'get_desc1_hresult': '0x%08X' % (desc_hr & 0xffffffff),
+                }
+                adapters.append((adapter, _direct3d_compact(identity)))
+                adapter = ctypes.c_void_p()
+            finally:
+                if adapter.value:
+                    _direct3d_release_com(adapter)
+            index += 1
+        summary.update({'status': 'available', 'adapter_count': len(adapters)})
+        return adapters, summary
+    except (AttributeError, OSError, ValueError) as error:
+        summary['error'] = type(error).__name__
+        return [], summary
+    finally:
+        _direct3d_release_com(factory)
+
+
+def _direct3d_d3d11_device_probe(adapter: Any=None, adapter_identity: dict[str, Any] | None=None) -> dict[str, Any]:
     """Create no renderer, but verify the default hardware D3D11 device can initialize.
 
     This is deliberately opt-in because a successful device creation proves only
@@ -885,10 +961,11 @@ def _direct3d_d3d11_device_probe() -> dict[str, Any]:
     tracing, HDR, or presentation path.
     """
     result: dict[str, Any] = {
-        'kind': 'd3d11_default_hardware_device', 'requested': True,
+        'kind': 'd3d11_dxgi_adapter_device' if adapter else 'd3d11_default_hardware_device', 'requested': True,
         'status': 'not_applicable' if sys.platform != 'win32' else 'unavailable',
         'provenance': 'D3D11CreateDevice', 'feature_level': None,
-        'adapter_scope': 'default hardware adapter selected by D3D11',
+        'adapter_scope': 'explicit IDXGIAdapter1 from DXGI enumeration' if adapter else 'default hardware adapter selected by D3D11',
+        'adapter': adapter_identity,
         'error': None,
     }
     if sys.platform != 'win32':
@@ -904,7 +981,7 @@ def _direct3d_d3d11_device_probe() -> dict[str, Any]:
         # Newest first; D3D11CreateDevice returns the first supported level.
         levels = (ctypes.c_uint * 7)(0xc100, 0xc000, 0xb100, 0xb000, 0xa100, 0xa000, 0x9300)
         device, context, selected = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_uint()
-        hresult = create(None, 1, None, 0, levels, len(levels), 7,
+        hresult = create(adapter, 0 if adapter else 1, None, 0, levels, len(levels), 7,
                          ctypes.byref(device), ctypes.byref(selected), ctypes.byref(context))
         result['hresult'] = '0x%08X' % (hresult & 0xffffffff)
         if hresult >= 0 and device.value:
@@ -920,7 +997,7 @@ def _direct3d_d3d11_device_probe() -> dict[str, Any]:
     return result
 
 
-def _direct3d_d3d12_device_probe() -> dict[str, Any]:
+def _direct3d_d3d12_device_probe(adapter: Any=None, adapter_identity: dict[str, Any] | None=None) -> dict[str, Any]:
     """Create a default D3D12 device and read its base Options feature tier.
 
     The probe does not create queues, command lists, surfaces, or a renderer.
@@ -928,25 +1005,24 @@ def _direct3d_d3d12_device_probe() -> dict[str, Any]:
     different DXGI adapter must still validate that adapter itself.
     """
     result: dict[str, Any] = {
-        'kind': 'd3d12_default_device', 'requested': True,
+        'kind': 'd3d12_dxgi_adapter_device' if adapter else 'd3d12_default_device', 'requested': True,
         'status': 'not_applicable' if sys.platform != 'win32' else 'unavailable',
         'provenance': 'D3D12CreateDevice / ID3D12Device::CheckFeatureSupport',
-        'adapter_scope': 'default hardware adapter selected by D3D12',
+        'adapter_scope': 'explicit IDXGIAdapter1 from DXGI enumeration' if adapter else 'default hardware adapter selected by D3D12',
+        'adapter': adapter_identity,
         'minimum_feature_level': '11_0', 'options': {}, 'error': None,
     }
     if sys.platform != 'win32':
         return result
     try:
-        class Guid(ctypes.Structure):
-            _fields_ = [('data1', ctypes.c_uint32), ('data2', ctypes.c_uint16), ('data3', ctypes.c_uint16), ('data4', ctypes.c_ubyte * 8)]
         # IID_ID3D12Device from d3d12.h.
-        iid = Guid(0x189819F1, 0x1DB6, 0x4B57, (ctypes.c_ubyte * 8)(0xBE, 0x54, 0x18, 0x21, 0x33, 0x9B, 0x85, 0xF7))
+        iid = _Direct3dGuid(0x189819F1, 0x1DB6, 0x4B57, (ctypes.c_ubyte * 8)(0xBE, 0x54, 0x18, 0x21, 0x33, 0x9B, 0x85, 0xF7))
         library = ctypes.WinDLL('d3d12.dll')
         create = library.D3D12CreateDevice
-        create.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(Guid), ctypes.POINTER(ctypes.c_void_p)]
+        create.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(_Direct3dGuid), ctypes.POINTER(ctypes.c_void_p)]
         create.restype = ctypes.c_long
         device = ctypes.c_void_p()
-        hresult = create(None, 0xB000, ctypes.byref(iid), ctypes.byref(device))
+        hresult = create(adapter, 0xB000, ctypes.byref(iid), ctypes.byref(device))
         result['hresult'] = '0x%08X' % (hresult & 0xffffffff)
         if hresult < 0 or not device.value:
             result['error'] = 'D3D12CreateDevice failed'
@@ -986,16 +1062,46 @@ def _direct3d_d3d12_device_probe() -> dict[str, Any]:
     return result
 
 
-def _direct3d_collect_direct3d_info(skip_dxdiag: bool=False, active_device_probe: bool=False, active_d3d12_probe: bool=False) -> dict[str, Any]:
+def _direct3d_per_adapter_probes(d3d11: bool=False, d3d12: bool=False) -> dict[str, Any]:
+    """Probe each DXGI adapter on explicit request and release every COM object."""
+    report: dict[str, Any] = {
+        'requested': {'d3d11': d3d11, 'd3d12': d3d12},
+        'enumeration': {'requested': bool(d3d11 or d3d12), 'status': 'not_run'},
+        'adapters': [],
+        'limitations': ['DXGI adapter order is API-local and is not equated with CIM, CUDA, Vulkan, or application adapter selection. Software adapters are reported but not initialized.'],
+    }
+    if not (d3d11 or d3d12):
+        return report
+    adapters, enumeration = _direct3d_dxgi_adapters()
+    report['enumeration'] = enumeration
+    for adapter, identity in adapters:
+        entry: dict[str, Any] = {'identity': identity, 'd3d11': None, 'd3d12': None}
+        try:
+            if identity.get('software'):
+                entry['skipped'] = 'software DXGI adapter; no hardware device initialization requested'
+            else:
+                if d3d11:
+                    entry['d3d11'] = _direct3d_d3d11_device_probe(adapter, identity)
+                if d3d12:
+                    entry['d3d12'] = _direct3d_d3d12_device_probe(adapter, identity)
+        finally:
+            _direct3d_release_com(adapter)
+        report['adapters'].append(_direct3d_compact(entry))
+    return report
+
+
+def _direct3d_collect_direct3d_info(skip_dxdiag: bool=False, active_device_probe: bool=False, active_d3d12_probe: bool=False, per_adapter_d3d11_probe: bool=False, per_adapter_d3d12_probe: bool=False) -> dict[str, Any]:
     """Collect a stable Direct3D report with opt-in D3D11/D3D12 device evidence."""
     windows = sys.platform == 'win32'
-    report: dict[str, Any] = {'platform': {'operating_system': platform.system(), 'release': platform.release(), 'machine': platform.machine()}, 'direct3d': {'supported_platform': windows, 'availability': 'not_applicable' if not windows else 'unknown', 'runtime': {'registry': {}, 'dxdiag_version': None}, 'adapters': [], 'feature_levels': [], 'dxdiag': {'attempted': False, 'source': None, 'sections': {}}, 'active_device_probe': {'kind': 'd3d11_default_hardware_device', 'requested': False, 'status': 'not_run', 'provenance': 'D3D11CreateDevice', 'feature_level': None, 'adapter_scope': None, 'error': None}, 'd3d12_device_probe': {'kind': 'd3d12_default_device', 'requested': False, 'status': 'not_run', 'provenance': 'D3D12CreateDevice / ID3D12Device::CheckFeatureSupport', 'adapter_scope': None, 'options': {}, 'error': None}, 'limitations': []}}
+    report: dict[str, Any] = {'platform': {'operating_system': platform.system(), 'release': platform.release(), 'machine': platform.machine()}, 'direct3d': {'supported_platform': windows, 'availability': 'not_applicable' if not windows else 'unknown', 'runtime': {'registry': {}, 'dxdiag_version': None}, 'adapters': [], 'feature_levels': [], 'dxdiag': {'attempted': False, 'source': None, 'sections': {}}, 'active_device_probe': {'kind': 'd3d11_default_hardware_device', 'requested': False, 'status': 'not_run', 'provenance': 'D3D11CreateDevice', 'feature_level': None, 'adapter_scope': None, 'error': None}, 'd3d12_device_probe': {'kind': 'd3d12_default_device', 'requested': False, 'status': 'not_run', 'provenance': 'D3D12CreateDevice / ID3D12Device::CheckFeatureSupport', 'adapter_scope': None, 'options': {}, 'error': None}, 'per_adapter_device_probes': {'requested': {'d3d11': False, 'd3d12': False}, 'enumeration': {'requested': False, 'status': 'not_run'}, 'adapters': []}, 'limitations': []}}
     d3d = report['direct3d']
     if not windows:
         if active_device_probe:
             d3d['active_device_probe'] = _direct3d_d3d11_device_probe()
         if active_d3d12_probe:
             d3d['d3d12_device_probe'] = _direct3d_d3d12_device_probe()
+        if per_adapter_d3d11_probe or per_adapter_d3d12_probe:
+            d3d['per_adapter_device_probes'] = _direct3d_per_adapter_probes(per_adapter_d3d11_probe, per_adapter_d3d12_probe)
         d3d['limitations'].append('Direct3D is a Windows API; no compatibility layer is probed on this platform.')
         return report
     inventory, source = _direct3d_windows_inventory()
@@ -1017,6 +1123,8 @@ def _direct3d_collect_direct3d_info(skip_dxdiag: bool=False, active_device_probe
         d3d['d3d12_device_probe'] = _direct3d_d3d12_device_probe()
         if d3d['d3d12_device_probe'].get('status') != 'passed':
             d3d['limitations'].append('The requested default-adapter D3D12 probe did not pass; inspect d3d12_device_probe rather than inferring D3D12 support.')
+    if per_adapter_d3d11_probe or per_adapter_d3d12_probe:
+        d3d['per_adapter_device_probes'] = _direct3d_per_adapter_probes(per_adapter_d3d11_probe, per_adapter_d3d12_probe)
     if skip_dxdiag:
         d3d['limitations'].append('DxDiag was skipped; exact feature levels were not queried.')
         return report
@@ -1107,9 +1215,101 @@ def _metal_version(command: list[str]) -> str | None:
     output, _ = _metal_run(command, timeout=15)
     return output.strip() if output else None
 
-def _metal_collect_metal_info() -> dict[str, Any]:
+
+def _metal_native_device_probe() -> dict[str, Any]:
+    """Enumerate MTLDevice objects through a temporary Swift program.
+
+    Metal does not expose a single runtime "version" comparable to Vulkan's
+    apiVersion.  A native MTLDevice and its supported GPU families are the
+    authoritative capability boundary.  The helper creates no command queue,
+    buffers, textures, pipelines, or render/compute work.
+    """
+    result: dict[str, Any] = {
+        'status': 'not_applicable' if platform.system() != 'Darwin' else 'unavailable',
+        'provenance': 'Swift Metal.framework / MTLCopyAllDevices',
+        'active_probe': False,
+        'devices': [],
+        'error': None,
+    }
+    if platform.system() != 'Darwin':
+        return result
+    swift, find_error = _metal_run(['xcrun', '--find', 'swift'], timeout=15)
+    if not swift:
+        result['error'] = find_error or 'xcrun could not locate swift'
+        return result
+    source = r'''
+import Foundation
+import Metal
+
+func familyNames(_ device: MTLDevice) -> [String] {
+    if #available(macOS 10.15, *) {
+        let families: [(String, MTLGPUFamily)] = [
+            ("apple1", .apple1), ("apple2", .apple2), ("apple3", .apple3),
+            ("apple4", .apple4), ("apple5", .apple5), ("apple6", .apple6),
+            ("apple7", .apple7), ("mac1", .mac1), ("mac2", .mac2)
+        ]
+        return families.compactMap { device.supportsFamily($0.1) ? $0.0 : nil }
+    }
+    return []
+}
+
+let devices = MTLCopyAllDevices()
+let values: [[String: Any]] = devices.map { device in
+    [
+        "name": device.name,
+        "registry_id": String(device.registryID),
+        "is_low_power": device.isLowPower,
+        "is_headless": device.isHeadless,
+        "is_removable": device.isRemovable,
+        "has_unified_memory": device.hasUnifiedMemory,
+        "supported_gpu_families": familyNames(device)
+    ]
+}
+let report: [String: Any] = ["devices": values]
+let data = try! JSONSerialization.data(withJSONObject: report, options: [])
+print(String(data: data, encoding: .utf8)!)
+'''
+    target: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.swift', prefix='fluent-metal-', delete=False) as handle:
+            handle.write(source)
+            target = handle.name
+        completed = subprocess.run(
+            [swift.strip(), target], text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=45, check=False,
+        )
+        if completed.returncode != 0:
+            result['error'] = (completed.stderr.strip() or completed.stdout.strip() or 'swift exited %d' % completed.returncode)[:4000]
+            return result
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            result['error'] = 'native Metal probe returned invalid JSON: %s' % error
+            return result
+        devices = payload.get('devices') if isinstance(payload, dict) else None
+        if not isinstance(devices, list):
+            result['error'] = 'native Metal probe returned no device list'
+            return result
+        result.update({'status': 'available', 'active_probe': True, 'devices': devices})
+        if not devices:
+            result['status'] = 'unavailable'
+            result['error'] = 'MTLCopyAllDevices returned no Metal devices'
+    except subprocess.TimeoutExpired:
+        result['error'] = 'timed out after 45 seconds'
+    except OSError as error:
+        result['error'] = type(error).__name__ + ': ' + str(error)
+    finally:
+        if target:
+            try:
+                Path(target).unlink(missing_ok=True)
+            except OSError:
+                pass
+    return result
+
+
+def _metal_collect_metal_info(native_device_probe: bool=False) -> dict[str, Any]:
     system = platform.system()
-    tools = {'system_profiler': _metal_tool('system_profiler'), 'xcrun': _metal_tool('xcrun'), 'xcodebuild': _metal_tool('xcodebuild')}
+    tools = {'system_profiler': _metal_tool('system_profiler'), 'xcrun': _metal_tool('xcrun'), 'xcodebuild': _metal_tool('xcodebuild'), 'swift': _metal_tool('swift')}
     probes: list[dict[str, Any]] = []
     limitations: list[str] = []
     devices: list[Any] = []
@@ -1119,6 +1319,17 @@ def _metal_collect_metal_info() -> dict[str, Any]:
     if system != 'Darwin':
         limitations.append('Metal is an Apple platform API and is not natively available on this operating system.')
     else:
+        native = {'status': 'not_requested', 'provenance': 'Swift Metal.framework / MTLCopyAllDevices', 'active_probe': False, 'devices': []}
+        if native_device_probe:
+            native = _metal_native_device_probe()
+            probes.append({'command': ['xcrun', '--find', 'swift', '<temporary Metal source>'], 'status': native['status'], 'error': native.get('error')})
+            if native['status'] == 'available':
+                available = True
+                details['metal_api_version'] = None
+                details['metal_api_version_note'] = 'Metal has no separately queryable runtime API-version integer; native supported_gpu_families are the capability evidence.'
+            else:
+                limitations.append('Native MTLDevice enumeration was unavailable; compiler/toolchain evidence and system_profiler fields do not confirm Metal runtime support.')
+        details['native_device_probe'] = native
         raw, error = _metal_run(['system_profiler', 'SPDisplaysDataType', 'SPHardwareDataType', 'SPSoftwareDataType', '-xml'])
         probes.append({'command': ['system_profiler', 'SPDisplaysDataType', 'SPHardwareDataType', 'SPSoftwareDataType', '-xml'], 'status': 'ok' if raw else 'unavailable', 'error': error})
         if raw:
@@ -1130,9 +1341,11 @@ def _metal_collect_metal_info() -> dict[str, Any]:
                 details['system_profiler'] = profiler
                 details['metal_related_fields'] = _metal_metal_fields(devices)
                 details['display_adapter_inventory_available'] = bool(devices)
-                available = None
+                if available is not True:
+                    available = None
         else:
-            available = None
+            if available is not True:
+                available = None
             limitations.append('system_profiler could not enumerate display hardware; inspect the probe error.')
         if tools['xcrun']['found']:
             path, path_error = _metal_run(['xcrun', '--find', 'metal'], timeout=15)
@@ -1143,7 +1356,7 @@ def _metal_collect_metal_info() -> dict[str, Any]:
             toolchain['metal_compiler_version'] = version.strip() if version else None
         if tools['xcodebuild']['found']:
             toolchain['xcode_version'] = _metal_version(['xcodebuild', '-version'])
-        limitations.append('system_profiler inventories display adapters, not native MTLDevice creation. This tool leaves Metal availability unknown unless a future native Metal probe confirms it; query a native Metal program for exact support and capabilities.')
+        limitations.append('system_profiler inventories display adapters, not native MTLDevice creation. Metal compiler/Xcode versions describe development tooling, not a Metal API version or application compatibility.')
     info = _metal_clean({'available': available, 'tools': tools, 'toolchain': toolchain, 'devices': devices, 'details': details, 'probes': probes, 'limitations': limitations})
     info['available'] = available
     return {'platform': {'operating_system': system, 'operating_system_release': platform.release(), 'machine': platform.machine()}, 'metal': info}
@@ -1502,8 +1715,86 @@ def _nvidia_ngx_components() -> dict[str, Any]:
         roots.append(Path(os.environ.get('SystemRoot', 'C:\\\\Windows')) / 'System32')
     found: dict[str, list[str]] = {}
     for feature, candidates in names.items():
-        found[feature] = [str(root / candidate) for root in roots for candidate in candidates if (root / candidate).is_file()]
-    return {'searched_paths': len(roots), 'components': found}
+        # Preserve order while allowing a DLL directory to also appear on PATH.
+        found[feature] = list(dict.fromkeys(str(root / candidate) for root in roots for candidate in candidates if (root / candidate).is_file()))
+    paths = [path for values in found.values() for path in values]
+    return {
+        'searched_paths': len(roots),
+        'components': found,
+        'component_metadata': _nvidia_component_metadata(paths),
+        'limitations': [
+            'These are passive local-file observations. File version resources identify a shipped NGX binary, not a DLSS SDK generation, GPU eligibility, driver support, or application initialization.',
+            'There is no reliable, application-independent mapping from an NGX component file version to a marketing label such as DLSS 5; that support remains unknown without an NGX/application query.',
+        ],
+    }
+
+
+def _nvidia_windows_file_versions(paths: list[str]) -> dict[str, dict[str, Any]]:
+    """Read Windows version resources without loading any NGX DLL.
+
+    PowerShell's VersionInfo wrapper delegates to the Win32 version-resource
+    APIs. Paths are supplied as arguments rather than interpolated into the
+    script, so a local filename cannot alter the command being executed.
+    """
+    if sys.platform != 'win32' or not paths:
+        return {}
+    path_payload = base64.b64encode(json.dumps(paths).encode('utf-8')).decode('ascii')
+    script = r'''
+$ErrorActionPreference = 'Stop'
+$pathJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PATH_PAYLOAD__'))
+$paths = @($pathJson | ConvertFrom-Json)
+$items = @($paths | ForEach-Object {
+  try {
+    $item = Get-Item -LiteralPath $_ -ErrorAction Stop
+    $info = $item.VersionInfo
+    [pscustomobject]@{ path = $item.FullName; file_version = $info.FileVersion; product_version = $info.ProductVersion; company_name = $info.CompanyName; original_filename = $info.OriginalFilename }
+  } catch {
+    [pscustomobject]@{ path = $_; error = $_.Exception.GetType().Name }
+  }
+})
+$items | ConvertTo-Json -Compress
+'''.replace('__PATH_PAYLOAD__', path_payload)
+    executable = shutil.which('powershell') or shutil.which('pwsh')
+    if not executable:
+        return {}
+    try:
+        encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+        result = subprocess.run([executable, '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False)
+        if result.returncode or not result.stdout.strip():
+            return {}
+        rows = json.loads(result.stdout)
+        rows = rows if isinstance(rows, list) else [rows] if isinstance(rows, dict) else []
+        return {str(row.get('path')).casefold(): row for row in rows if isinstance(row, dict) and row.get('path')}
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return {}
+
+
+def _nvidia_component_metadata(paths: list[str]) -> list[dict[str, Any]]:
+    """Return passive component metadata; never load or initialize NGX."""
+    versions = _nvidia_windows_file_versions(paths)
+    metadata: list[dict[str, Any]] = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        try:
+            stat = path.stat()
+            item: dict[str, Any] = {
+                'path': str(path), 'size_bytes': stat.st_size,
+                'modified_utc': datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+                'provenance': 'filesystem metadata',
+            }
+        except OSError as error:
+            item = {'path': str(path), 'size_bytes': None, 'modified_utc': None, 'provenance': 'filesystem metadata', 'error': type(error).__name__}
+        version = versions.get(str(path).casefold())
+        if version:
+            item['windows_version_resource'] = {
+                key: version.get(key) for key in ('file_version', 'product_version', 'company_name', 'original_filename')
+            }
+            item['version_provenance'] = 'Windows file version resource'
+        else:
+            item['windows_version_resource'] = None
+            item['version_provenance'] = 'unavailable' if sys.platform == 'win32' else 'not_applicable'
+        metadata.append(item)
+    return metadata
 
 def _nvidia_feature(detection: str='unknown', support: str='unknown', eligibility: str='unknown', evidence: list[dict[str, Any]] | None=None, limitation: str | None=None) -> dict[str, Any]:
     result = {'detection': detection, 'support': support, 'eligibility': eligibility, 'evidence': evidence or []}
@@ -1523,7 +1814,9 @@ def _nvidia_capabilities(device: dict[str, Any], nvml: dict[str, Any], vulkan_ex
     caps: dict[str, Any] = {}
     for feature in ('dlss_super_resolution', 'dlss_frame_generation', 'dlss_ray_reconstruction'):
         files = ngx['components'].get(feature, [])
-        caps[feature] = _nvidia_feature('detected' if files else 'unknown', 'unknown', 'unknown', [{'source': 'local_ngx_component', 'paths': files}] if files else [], 'DLSS support is negotiated by NGX in an application; neither a GPU name nor a driver version confirms it.')
+        metadata = [item for item in ngx.get('component_metadata', []) if item.get('path') in files]
+        caps[feature] = _nvidia_feature('detected' if files else 'unknown', 'unknown', 'unknown', [{'source': 'local_ngx_component', 'paths': files, 'metadata': metadata}] if files else [], 'DLSS support is negotiated by NGX in an application; local component versions do not establish DLSS 5, GPU eligibility, or game support.')
+    caps['dlss_5'] = _nvidia_feature('unknown', 'unknown', 'unknown', [], 'No safe, application-independent NGX query maps a local component, driver, or GPU to the marketing label DLSS 5. Run the target application/NGX integration to establish actual support.')
     reflex_extensions = {'VK_NV_low_latency', 'VK_NV_low_latency2'}
     reflex = sorted(vulkan_extensions & reflex_extensions)
     caps['reflex'] = _nvidia_feature('detected' if reflex else 'unknown', 'unknown', 'unknown', [{'source': 'vulkaninfo', 'extensions': reflex}] if reflex else [], 'A Vulkan low-latency extension is evidence of a driver interface, not proof that NVIDIA Reflex SDK integration will initialize in a game.')
@@ -2008,6 +2301,61 @@ def _vulkan_loader_paths() -> list[str]:
     candidates = [Path('/usr/lib/libvulkan.so.1'), Path('/usr/lib64/libvulkan.so.1'), Path('/lib/x86_64-linux-gnu/libvulkan.so.1')]
     return [str(path) for path in candidates if path.exists()]
 
+def _vulkan_decode_api_version(value: int) -> dict[str, Any]:
+    """Decode VkVersion without conflating loader and physical-device support."""
+    return {
+        'raw': '0x%08X' % (value & 0xffffffff),
+        'variant': (value >> 29) & 0x7,
+        'major': (value >> 22) & 0x7f,
+        'minor': (value >> 12) & 0x3ff,
+        'patch': value & 0xfff,
+        'text': '%d.%d.%d' % ((value >> 22) & 0x7f, (value >> 12) & 0x3ff, value & 0xfff),
+    }
+
+def _vulkan_loader_version_probe(loaders: list[str]) -> dict[str, Any]:
+    """Read vkEnumerateInstanceVersion without creating a Vulkan instance.
+
+    This is loader-only evidence. It cannot enumerate an ICD or physical
+    device, and therefore never establishes usable device/API support.
+    """
+    result: dict[str, Any] = {
+        'status': 'unavailable', 'provenance': 'vkEnumerateInstanceVersion',
+        'library_path': None, 'instance_api_version': None, 'error': None,
+        'active_initialization': False,
+    }
+    candidates = list(loaders)
+    discovered = ctypes.util.find_library('vulkan')
+    if discovered and discovered not in candidates:
+        candidates.append(discovered)
+    if platform.system() == 'Windows' and 'vulkan-1.dll' not in candidates:
+        candidates.append('vulkan-1.dll')
+    if not candidates:
+        result['error'] = 'no Vulkan loader path was discovered'
+        return result
+    failures: list[str] = []
+    for candidate in candidates:
+        try:
+            library = ctypes.WinDLL(candidate) if platform.system() == 'Windows' else ctypes.CDLL(candidate)
+            result['library_path'] = candidate
+            enumerate_version = getattr(library, 'vkEnumerateInstanceVersion', None)
+            if enumerate_version is None:
+                result.update({'status': 'not_exposed', 'error': 'vkEnumerateInstanceVersion was not exported by this loader'})
+                return result
+            enumerate_version.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+            enumerate_version.restype = ctypes.c_int32
+            value = ctypes.c_uint32()
+            status = enumerate_version(ctypes.byref(value))
+            result['vk_result'] = int(status)
+            if status == 0:
+                result.update({'status': 'available', 'instance_api_version': _vulkan_decode_api_version(value.value)})
+                return result
+            result.update({'status': 'failed', 'error': 'vkEnumerateInstanceVersion returned VkResult %d' % status})
+            return result
+        except (AttributeError, OSError, ValueError) as error:
+            failures.append('%s: %s' % (candidate, type(error).__name__))
+    result['error'] = '; '.join(failures) or 'the Vulkan loader could not be opened'
+    return result
+
 def _vulkan_find_values(value: Any, names: set[str], results: list[dict[str, Any]], path: str='') -> None:
     """Extract useful cross-SDK fields while retaining the complete document."""
     if isinstance(value, dict):
@@ -2093,6 +2441,9 @@ def _vulkan_collect_vulkan_info() -> dict[str, Any]:
     details: Any = {}
     summary: dict[str, Any] = {'selected_fields': []}
     available: bool | None = None
+    loaders = _vulkan_loader_paths()
+    loader_probe = _vulkan_loader_version_probe(loaders)
+    summary['loader'] = loader_probe
     if tools['vulkaninfo']['found']:
         text_summary, summary_error = _vulkan_run(['vulkaninfo', '--summary'])
         probes.append({'command': ['vulkaninfo', '--summary'], 'status': 'ok' if text_summary else 'unavailable', 'error': summary_error})
@@ -2109,12 +2460,11 @@ def _vulkan_collect_vulkan_info() -> dict[str, Any]:
             limitations.append('vulkaninfo could not enumerate a Vulkan instance or physical device; inspect the probe error.')
     else:
         limitations.append('vulkaninfo is absent, so loader presence cannot prove that a Vulkan instance/device is usable.')
-    loaders = _vulkan_loader_paths()
     if loaders:
-        limitations.append('A Vulkan loader was found, but it is not proof of an installed ICD or usable physical device.')
+        limitations.append('A Vulkan loader was found, but even its reported instance API version is not proof of an installed ICD or usable physical device.')
     if platform.system() == 'Darwin':
         limitations.append('macOS does not expose native Vulkan; a portability implementation such as MoltenVK must be installed for Vulkan tooling to report devices.')
-    info = _vulkan_clean({'available': available, 'tools': tools, 'loader_paths': loaders, 'summary': summary, 'details': details, 'probes': probes, 'limitations': limitations})
+    info = _vulkan_clean({'available': available, 'tools': tools, 'loader_paths': loaders, 'loader_probe': loader_probe, 'summary': summary, 'details': details, 'probes': probes, 'limitations': limitations})
     info['available'] = available
     return {'platform': {'operating_system': platform.system(), 'operating_system_release': platform.release(), 'machine': platform.machine()}, 'vulkan': info}
 
@@ -2127,6 +2477,8 @@ def _vulkan_print_human(report: dict[str, Any]) -> None:
     extensions = [item['value'] for item in summary if item['path'].lower().endswith('extensionname')]
     extensions = extensions or runtime.get('instance_extensions_and_layer_names', [])
     print('Vulkan available: %s' % ('yes' if info.get('available') else 'no' if info.get('available') is False else 'unknown'))
+    loader_version = (info.get('loader_probe') or {}).get('instance_api_version') or {}
+    print('Loader instance API version: %s' % (loader_version.get('text') or 'not reported'))
     print('Devices (%d): %s' % (len(devices), '; '.join((str(value) for value in devices[:4])) or 'not discovered'))
     print('Reported extensions: %d; selected fields: %d' % (len(extensions), len(summary)))
     for limitation in info['limitations']:
@@ -2676,7 +3028,7 @@ def _gpu_capability_matrix(report: dict[str, Any], smoke_tests: dict[str, Any]) 
             'limitations': ['Canonical adapters are matched by UUID or PCI when possible. A name-only match is explicitly lower confidence and is never proof of a physical-device identity.', 'This profile intentionally omits raw Vulkan, DxDiag, and tool output. Request --full --json for complete source evidence.']}
 
 
-def _gpu_smoke_tests(request: list[str], report: dict[str, Any]) -> dict[str, Any]:
+def _gpu_smoke_tests(request: list[str], report: dict[str, Any], per_adapter_request: list[str] | None=None) -> dict[str, Any]:
     requested = sorted(set(request))
     d3d = report.get('apis', {}).get('direct3d') or {}
     probe = d3d.get('direct3d', {}).get('active_device_probe') if isinstance(d3d, dict) else None
@@ -2686,6 +3038,10 @@ def _gpu_smoke_tests(request: list[str], report: dict[str, Any]) -> dict[str, An
         results['d3d11'] = probe if isinstance(probe, dict) else {'kind': 'd3d11_default_hardware_device', 'requested': True, 'status': 'not_run', 'error': 'Direct3D section was not collected'}
     if 'd3d12' in requested:
         results['d3d12'] = d3d12_probe if isinstance(d3d12_probe, dict) else {'kind': 'd3d12_default_device', 'requested': True, 'status': 'not_run', 'error': 'Direct3D section was not collected'}
+    per_adapter = d3d.get('direct3d', {}).get('per_adapter_device_probes') if isinstance(d3d, dict) else None
+    for name in sorted(set(per_adapter_request or [])):
+        key = 'per_adapter_' + name
+        results[key] = per_adapter if isinstance(per_adapter, dict) else {'requested': True, 'status': 'not_run', 'error': 'Direct3D section was not collected'}
     for name in requested:
         if name not in {'d3d11', 'd3d12'}:
             results[name] = {'kind': name, 'requested': True, 'status': 'unsupported', 'error': 'No safe portable active probe is implemented for this API yet'}
@@ -2718,12 +3074,30 @@ def _parse_smoke_tests(values: list[str] | None) -> list[str]:
     return requested
 
 
+def _parse_per_adapter_probes(values: list[str] | None) -> list[str]:
+    requested: list[str] = []
+    for value in values or []:
+        for name in value.split(','):
+            name = name.strip().lower()
+            if not name:
+                continue
+            names = ('d3d11', 'd3d12') if name == 'all' else (name,)
+            for item in names:
+                if item not in {'d3d11', 'd3d12'}:
+                    raise ValueError("unknown per-adapter probe %r (choose from: d3d11, d3d12)" % item)
+                if item not in requested:
+                    requested.append(item)
+    return requested
+
+
 def collect_gpu_info(
     sections: list[str] | None = None,
     full: bool = False,
     skip_dxdiag: bool = False,
     include_dxdiag: bool = False,
     smoke_tests: list[str] | None = None,
+    per_adapter_probes: list[str] | None = None,
+    metal_native_probe: bool = False,
 ) -> dict[str, Any]:
     """Collect selected sections, preserving every underlying collector payload.
 
@@ -2738,8 +3112,9 @@ def collect_gpu_info(
     inventory = collect_inventory()
     overview = not full and not sections
     smoke_tests = smoke_tests or []
+    per_adapter_probes = per_adapter_probes or []
     chosen = list(SECTION_NAMES) if full else (sections or _default_sections(inventory))
-    if ({'d3d11', 'd3d12'} & set(smoke_tests)) and 'direct3d' not in chosen:
+    if ({'d3d11', 'd3d12'} & (set(smoke_tests) | set(per_adapter_probes))) and 'direct3d' not in chosen:
         # The result must never say a requested probe ran without its collector.
         chosen.append('direct3d')
     if "inventory" not in chosen:
@@ -2765,6 +3140,8 @@ def collect_gpu_info(
             "sections": chosen,
             "skip_dxdiag": effective_skip_dxdiag,
             "dxdiag_mode": dxdiag_mode,
+            "per_adapter_probes": per_adapter_probes,
+            "metal_native_probe": metal_native_probe,
         },
         "inventory": inventory,
         "vendors": {"nvidia": None, "amd": None},
@@ -2779,11 +3156,13 @@ def collect_gpu_info(
             skip_dxdiag=effective_skip_dxdiag,
             active_device_probe='d3d11' in smoke_tests,
             active_d3d12_probe='d3d12' in smoke_tests,
+            per_adapter_d3d11_probe='d3d11' in per_adapter_probes,
+            per_adapter_d3d12_probe='d3d12' in per_adapter_probes,
         ),
         "vulkan": _vulkan_collect_vulkan_info,
         "opengl": _opengl_collect_opengl_info,
         "opencl": _opencl_collect_opencl_info,
-        "metal": _metal_collect_metal_info,
+        "metal": lambda: _metal_collect_metal_info(native_device_probe=metal_native_probe),
     }
     for name in chosen:
         if name == "inventory":
@@ -2797,7 +3176,7 @@ def collect_gpu_info(
         else:
             report["apis"][name] = payload
         report["executed_sections"].append(name)
-    report['smoke_tests'] = _gpu_smoke_tests(smoke_tests, report)
+    report['smoke_tests'] = _gpu_smoke_tests(smoke_tests, report, per_adapter_probes)
     return report
 
 
@@ -2835,6 +3214,8 @@ def main() -> int:
     dxdiag.add_argument("--include-dxdiag", action="store_true", help="allow DxDiag in a full report (explicit Direct3D already enables it)")
     dxdiag.add_argument("--skip-dxdiag", action="store_true", help="when Direct3D runs, do not launch DxDiag or create its temporary report")
     parser.add_argument("--smoke-test", action="append", metavar="LIST", help="optional active initialization probe; comma-separated: d3d11, d3d12 (or all)")
+    parser.add_argument("--per-adapter-probe", action="append", metavar="LIST", help="opt-in DXGI-adapter initialization probe; comma-separated: d3d11, d3d12 (or all)")
+    parser.add_argument("--metal-native-probe", action="store_true", help="on macOS, enumerate MTLDevice capabilities through a temporary Swift Metal program")
     add_common_arguments(parser)
     args = parser.parse_args()
     if args.output_schema:
@@ -2846,6 +3227,7 @@ def main() -> int:
     try:
         sections = _parse_sections(args.sections)
         smoke_tests = _parse_smoke_tests(args.smoke_test)
+        per_adapter_probes = _parse_per_adapter_probes(args.per_adapter_probe)
     except ValueError as error:
         parser.error(str(error))
     report = collect_gpu_info(
@@ -2854,6 +3236,8 @@ def main() -> int:
         skip_dxdiag=args.skip_dxdiag,
         include_dxdiag=args.include_dxdiag,
         smoke_tests=smoke_tests,
+        per_adapter_probes=per_adapter_probes,
+        metal_native_probe=args.metal_native_probe,
     )
     report = finalize_report(report, args, 'gpu_info', _gpu_summary)
     if args.json:

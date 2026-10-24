@@ -16,6 +16,9 @@ can initialize every backend or that a listed microphone can record.
 - Windows: PnP `AudioEndpoint` records used by WASAPI: render/capture
   direction, endpoint state, PnP driver provider/version, and the user-level
   microphone-consent default where exposed.
+- Windows API runtime evidence: WASAPI/MMDevice, DirectSound, XAudio2, and
+  Media Foundation component presence. WASAPI additionally reports passive
+  default-endpoint roles and can opt in to `IAudioClient.GetMixFormat`.
 - macOS: CoreAudio-related `system_profiler SPAudioDataType` inventory.
 - Linux: PipeWire (`pw-dump`), PulseAudio (`pactl -f json`), and ALSA procfs
   inventories. These may coexist; unavailable daemons are reported separately.
@@ -74,6 +77,16 @@ default roles, formats/layouts, driver evidence, and metadata. A field being
 empty or `null` means the selected passive probe did not establish it; consult
 the backend `status`, `errors`, and `limitations` before interpreting it.
 
+On Windows, `audio.platform_backends.wasapi.data.api_runtimes` separates
+runtime-component presence from stronger WASAPI evidence. DirectSound, XAudio2,
+and Media Foundation entries report System32 component files only. They do not
+claim that an endpoint or application can create an API object. The WASAPI
+entry records whether the passive default-role query worked and whether the
+opt-in `GetMixFormat` probe was requested or succeeded.
+This API evidence remains available if the separate PnP endpoint inventory is
+unavailable; in that case endpoint, driver, and microphone-consent fields are
+empty or `unknown` rather than inferred.
+
 `--profile llm` and `--profile summary` emit counts, status, defaults, and
 error codes rather than raw endpoint records. The default `full` profile keeps
 the complete backwards-compatible evidence report. Built-in portable output
@@ -93,6 +106,8 @@ roles. `--endpoint-formats` additionally activates `IAudioClient` only to read
 default shared-mode mix formats; exclusive modes, arbitrary endpoints, and
 actual stream initialization remain outside its scope. It reports only
 the user-level microphone-consent default, not each application's grant. The
+new DirectSound, XAudio2, and Media Foundation entries are component-presence
+evidence only: they never initialize those APIs.
 macOS inventory does not open `AudioObject`/`AudioUnit`, but preserves any
 default-endpoint and format details supplied by `system_profiler`.
 Linux portal grants and device-node ACLs are likewise not inferred from daemon

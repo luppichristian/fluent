@@ -834,6 +834,71 @@ public static class FluentAudioEndpointFormats {
     return probe
 
 
+def _windows_audio_api_inventory(
+    role_probe: dict[str, Any], format_probe: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return Windows audio-runtime evidence without opening a stream.
+
+    A system DLL being present establishes that Windows supplies that runtime
+    component; it is deliberately *not* treated as proof that a particular
+    endpoint, application, or feature can initialize it.  WASAPI gets the
+    stronger, opt-in IMMDevice/IAudioClient evidence collected elsewhere.
+    """
+    system_root = Path(os.environ.get("SystemRoot", r"C:\\Windows"))
+    system32 = system_root / "System32"
+
+    def components(*names: str) -> list[dict[str, Any]]:
+        return [
+            {"name": name, "path": str(system32 / name), "present": (system32 / name).is_file()}
+            for name in names
+        ]
+
+    def component_status(items: list[dict[str, Any]]) -> str:
+        return "available" if any(item["present"] for item in items) else "unavailable"
+
+    wasapi_components = components("mmdevapi.dll", "audioses.dll")
+    directsound_components = components("dsound.dll")
+    xaudio_components = components("xaudio2_9.dll", "xaudio2_8.dll", "xaudio2_7.dll")
+    media_foundation_components = components("mf.dll", "mfplat.dll")
+    mix_status = "not_requested" if format_probe is None else format_probe.get("status", "unknown")
+    return {
+        "wasapi": {
+            "status": component_status(wasapi_components),
+            "provenance": ["Windows System32 component inventory", "IMMDeviceEnumerator"],
+            "components": wasapi_components,
+            "default_endpoint_roles": {
+                "status": role_probe.get("status", "unknown"),
+                "active_probe": bool((role_probe.get("provenance") or {}).get("active_probe")),
+            },
+            "shared_mode_mix_formats": {
+                "status": mix_status,
+                "provenance": "IAudioClient.GetMixFormat" if format_probe is not None else None,
+                "active_probe": bool((format_probe or {}).get("provenance", {}).get("active_probe")),
+                "note": "Only requested default endpoints are activated; no stream is initialized, rendered, or captured.",
+            },
+        },
+        "directsound": {
+            "status": component_status(directsound_components),
+            "provenance": ["Windows System32 component inventory"],
+            "components": directsound_components,
+        },
+        "xaudio2": {
+            "status": component_status(xaudio_components),
+            "provenance": ["Windows System32 component inventory"],
+            "components": xaudio_components,
+        },
+        "media_foundation": {
+            "status": component_status(media_foundation_components),
+            "provenance": ["Windows System32 component inventory"],
+            "components": media_foundation_components,
+        },
+        "limitations": [
+            "Component presence proves only that Windows supplies a runtime file; it does not prove endpoint compatibility, API initialization, playback, capture, codecs, effects, or application integration.",
+            "Only WASAPI has optional live evidence here: IMMDevice default-role lookup and IAudioClient.GetMixFormat when --endpoint-formats is requested. Neither creates an audio stream.",
+        ],
+    }
+
+
 def _windows_audio_backend(include_endpoint_formats: bool = False) -> dict[str, Any]:
     """Inventory Windows endpoint PnP records without changing audio routing.
 
@@ -872,6 +937,36 @@ try {
     if probe["status"] != "available":
         if probe["errors"] and "access" in probe["errors"][0]["message"].lower():
             probe["status"] = "denied"
+        # The PnP class is only the endpoint-inventory source.  Keep runtime
+        # component evidence independent so a missing cmdlet, permission
+        # denial, or PowerShell failure does not erase what Windows exposes
+        # about audio API availability.
+        role_probe = _windows_default_endpoint_roles()
+        format_probe = _windows_default_endpoint_formats() if include_endpoint_formats else None
+        formats = {
+            "status": "not_requested" if format_probe is None else format_probe.get("status", "unknown"),
+            "default_endpoint_mix_formats": (format_probe or {}).get("data") if format_probe else {},
+            "note": "GetMixFormat reports the shared-mode format of default endpoints only; it does not prove exclusive-mode, capture, or application stream compatibility.",
+        }
+        probe["data"] = {
+            "backend": "WASAPI runtime evidence; Windows PnP endpoint inventory unavailable",
+            "api_runtimes": _windows_audio_api_inventory(role_probe, format_probe),
+            "endpoints": [],
+            "default_roles": {
+                "status": role_probe.get("status", "unknown"),
+                "console": {"render": None, "capture": None},
+                "multimedia": {"render": None, "capture": None},
+                "communications": {"render": None, "capture": None},
+            },
+            "permissions": {
+                "microphone_permission": None,
+                "status": "unknown",
+                "scope": "Windows user-level default was not available because the PnP endpoint inventory failed",
+                "detail": None,
+            },
+            "format_capabilities": formats,
+        }
+        probe["limitations"].append("Windows PnP AudioEndpoint inventory was unavailable; endpoint records, PnP driver details, and microphone-consent evidence are not reported. API runtime evidence is collected independently.")
         return probe
     raw = probe["data"] or {}
     records = raw.get("endpoints") or []
@@ -916,6 +1011,7 @@ try {
     }
     probe["data"] = {
         "backend": "WASAPI endpoint inventory via Windows PnP",
+        "api_runtimes": _windows_audio_api_inventory(role_probe, format_probe),
         "endpoints": endpoints,
         "default_roles": defaults,
         "permissions": {

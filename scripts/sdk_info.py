@@ -60,6 +60,47 @@ def first_existing(candidates: tuple[tuple[str, str | None], ...]) -> tuple[str 
     return None, "not-found"
 
 
+def first_matching(candidates: tuple[tuple[str, str | None], ...], matcher: Any) -> tuple[str | None, str]:
+    """Choose the first root that contains a section-specific marker."""
+    for source, value in candidates:
+        if value:
+            try:
+                if matcher(str(value)):
+                    return str(value), source
+            except OSError:
+                pass
+    return None, "not-found"
+
+
+def child_directories(path: str | Path) -> tuple[str, ...]:
+    """Return immediate child directories from an explicit conventional root."""
+    try:
+        return tuple(str(item) for item in Path(path).iterdir() if item.is_dir())
+    except OSError:
+        return ()
+
+
+def conventional_roots(label: str, bases: tuple[str | None, ...], depth: int = 0) -> tuple[tuple[str, str], ...]:
+    """Expand a small, named conventional SDK location without disk crawling."""
+    paths = tuple(str(Path(base)) for base in bases if base)
+    for _ in range(depth):
+        paths = tuple(child for path in paths for child in child_directories(path))
+    return tuple((f"conventional:{label}:{path}", path) for path in paths)
+
+
+def argument_roots(roots: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    """Label explicit user roots without expanding or searching beneath them."""
+    return tuple(("argument:--root", root) for root in roots)
+
+
+def windows_program_files(*parts: str) -> tuple[str, ...]:
+    """Build deduplicated conventional Program Files paths on Windows only."""
+    if platform.system() != "Windows":
+        return ()
+    values = (os.environ.get("ProgramW6432"), os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"))
+    return tuple(dict.fromkeys(str(Path(value).joinpath(*parts)) for value in values if value))
+
+
 def package_version(names: tuple[str, ...]) -> dict[str, Any]:
     """Ask pkg-config only for fixed package names, with bounded local output."""
     executable = shutil.which("pkg-config") or shutil.which("pkgconf")
@@ -82,64 +123,102 @@ def development_status(artifacts: dict[str, bool], tools: dict[str, dict[str, An
     return "unavailable"
 
 
-def android() -> dict[str, Any]:
+def android(roots: tuple[str, ...] = ()) -> dict[str, Any]:
     ndk = tool("ndk-build")
     sdk_home = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
-    root, source = first_existing(tuple((f"environment:{name}", os.environ.get(name)) for name in ("ANDROID_NDK_ROOT", "ANDROID_NDK_HOME", "NDK_HOME")) + (("android-sdk:ndk", str(Path(sdk_home) / "ndk")) if sdk_home else ()))
+    standard_sdk_roots = (
+        str(Path(os.environ["LOCALAPPDATA"]) / "Android" / "Sdk") if platform.system() == "Windows" and os.environ.get("LOCALAPPDATA") else None,
+        str(Path.home() / "Library" / "Android" / "sdk") if platform.system() == "Darwin" else None,
+        str(Path.home() / "Android" / "Sdk") if platform.system() == "Linux" else None,
+    )
+    candidates = tuple((f"environment:{name}", os.environ.get(name)) for name in ("ANDROID_NDK_ROOT", "ANDROID_NDK_HOME", "NDK_HOME"))
+    candidates += argument_roots(roots)
+    candidates += (("android-sdk:ndk", str(Path(sdk_home) / "ndk")) if sdk_home else ())
+    candidates += conventional_roots("android-sdk-ndk", tuple(str(Path(path) / "ndk") for path in standard_sdk_roots if path), depth=1)
+    root, source = first_matching(candidates, lambda path: header(path, "source.properties") or header(path, "build", "cmake", "android.toolchain.cmake"))
     markers = {"source.properties": header(root, "source.properties"), "android.toolchain.cmake": header(root, "build", "cmake", "android.toolchain.cmake")}
     tools = {"ndk-build": ndk, "sdkmanager": tool("sdkmanager")}
     return {"status": development_status(markers, tools), "environment": paths_from_environment(("ANDROID_NDK_ROOT", "ANDROID_NDK_HOME", "NDK_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT")), "root": evidence(root, source), "markers": markers, "tools": tools}
 
-def qt() -> dict[str, Any]:
+def qt(roots: tuple[str, ...] = ()) -> dict[str, Any]:
     qmake = tool("qmake")
-    root = next((os.environ.get(name) for name in ("QTDIR", "Qt6_DIR", "Qt5_DIR") if os.environ.get(name)), None)
+    configured_root = next((os.environ.get(name) for name in ("QTDIR", "Qt6_DIR", "Qt5_DIR") if os.environ.get(name)), None)
+    standard_roots = conventional_roots("qt", (r"C:\Qt",), depth=2) if platform.system() == "Windows" else ()
+    root, source = first_matching((("environment:QTDIR/Qt*_DIR", configured_root),) + argument_roots(roots) + standard_roots, lambda path: header(path, "include", "QtCore", "qglobal.h") or header(path, "QtCore", "qglobal.h"))
     tools = {"qmake": qmake, "qtpaths": tool("qtpaths"), "cmake": tool("cmake")}
     headers = {"QtCore/qglobal.h": header(root, "include", "QtCore", "qglobal.h") or header(root, "QtCore", "qglobal.h")}
     package = package_version(("Qt6Core", "Qt5Core"))
-    return {"status": development_status(headers, {"qmake": qmake, "qtpaths": tools["qtpaths"]}, package), "environment": paths_from_environment(("QTDIR", "Qt6_DIR", "Qt5_DIR")), "root": evidence(root, "environment:QTDIR/Qt*_DIR"), "headers": headers, "package": package, "tools": tools, "qmake_version": version([str(qmake["path"]), "-query", "QT_VERSION"]) if qmake["path"] else None}
+    return {"status": development_status(headers, {"qmake": qmake, "qtpaths": tools["qtpaths"]}, package), "environment": paths_from_environment(("QTDIR", "Qt6_DIR", "Qt5_DIR")), "root": evidence(root, source), "headers": headers, "package": package, "tools": tools, "qmake_version": version([str(qmake["path"]), "-query", "QT_VERSION"]) if qmake["path"] else None}
 
-def openssl() -> dict[str, Any]:
+def openssl(roots: tuple[str, ...] = ()) -> dict[str, Any]:
     executable = tool("openssl")
-    root = next((os.environ.get(name) for name in ("OPENSSL_ROOT_DIR", "OPENSSL_ROOT") if os.environ.get(name)), None)
+    configured_root = next((os.environ.get(name) for name in ("OPENSSL_ROOT_DIR", "OPENSSL_ROOT") if os.environ.get(name)), None)
+    standard_roots = tuple((f"conventional:openssl:{path}", path) for path in windows_program_files("OpenSSL-Win64")) + tuple((f"conventional:openssl:{path}", path) for path in windows_program_files("OpenSSL-Win32"))
+    root, source = first_matching((("environment:OPENSSL_ROOT*", configured_root),) + argument_roots(roots) + standard_roots, lambda path: header(path, "include", "openssl", "ssl.h") or header(path, "Include", "openssl", "ssl.h"))
     headers = {"openssl/ssl.h": header(root, "include", "openssl", "ssl.h") or header(root, "Include", "openssl", "ssl.h")}
-    package = package_version(("openssl", "libssl")); return {"status": development_status(headers, {"openssl": executable}, package), "environment": paths_from_environment(("OPENSSL_ROOT_DIR", "OPENSSL_ROOT")), "root": evidence(root, "environment:OPENSSL_ROOT*"), "headers": headers, "package": package, "tools": {"openssl": executable}, "version": version([str(executable["path"]), "version"]) if executable["path"] else None}
+    package = package_version(("openssl", "libssl")); return {"status": development_status(headers, {"openssl": executable}, package), "environment": paths_from_environment(("OPENSSL_ROOT_DIR", "OPENSSL_ROOT")), "root": evidence(root, source), "headers": headers, "package": package, "tools": {"openssl": executable}, "version": version([str(executable["path"]), "version"]) if executable["path"] else None}
 
 
-def sdl() -> dict[str, Any]:
-    root = next((os.environ.get(name) for name in ("SDL3DIR", "SDL2DIR", "SDL_DIR") if os.environ.get(name)), None)
+def sdl(roots: tuple[str, ...] = ()) -> dict[str, Any]:
+    configured_root = next((os.environ.get(name) for name in ("SDL3DIR", "SDL2DIR", "SDL_DIR") if os.environ.get(name)), None)
+    root, source = first_matching((("environment:SDL*_DIR", configured_root),) + argument_roots(roots), lambda path: header(path, "include", "SDL.h") or header(path, "include", "SDL2", "SDL.h") or header(path, "include", "SDL3", "SDL.h"))
     tools = {"sdl2-config": tool("sdl2-config"), "sdl3-config": tool("sdl3-config"), "pkg-config": tool("pkg-config")}
     headers = {"SDL.h": header(root, "include", "SDL.h") or header(root, "include", "SDL2", "SDL.h") or header(root, "include", "SDL3", "SDL.h")}
-    package = package_version(("sdl3", "sdl2")); return {"status": development_status(headers, tools, package), "environment": paths_from_environment(("SDL3DIR", "SDL2DIR", "SDL_DIR")), "root": evidence(root, "environment:SDL*_DIR"), "headers": headers, "package": package, "tools": tools}
+    package = package_version(("sdl3", "sdl2")); return {"status": development_status(headers, tools, package), "environment": paths_from_environment(("SDL3DIR", "SDL2DIR", "SDL_DIR")), "root": evidence(root, source), "headers": headers, "package": package, "tools": tools}
 
 
-def boost() -> dict[str, Any]:
-    root = os.environ.get("BOOST_ROOT") or os.environ.get("Boost_ROOT")
+def boost(roots: tuple[str, ...] = ()) -> dict[str, Any]:
+    configured_root = os.environ.get("BOOST_ROOT") or os.environ.get("Boost_ROOT")
+    root, source = first_matching((("environment:BOOST_ROOT/Boost_ROOT", configured_root),) + argument_roots(roots), lambda path: header(path, "boost", "version.hpp") or header(path, "include", "boost", "version.hpp"))
     tools = {"b2": tool("b2"), "bjam": tool("bjam")}; headers = {"boost/version.hpp": header(root, "boost", "version.hpp") or header(root, "include", "boost", "version.hpp")}; package = package_version(("boost",))
-    return {"status": development_status(headers, tools, package), "environment": paths_from_environment(("BOOST_ROOT", "Boost_ROOT")), "root": evidence(root, "environment:BOOST_ROOT/Boost_ROOT"), "headers": headers, "package": package, "tools": tools}
+    return {"status": development_status(headers, tools, package), "environment": paths_from_environment(("BOOST_ROOT", "Boost_ROOT")), "root": evidence(root, source), "headers": headers, "package": package, "tools": tools}
 
 
-def msvc() -> dict[str, Any]:
-    root = os.environ.get("VCToolsInstallDir") or os.environ.get("VCINSTALLDIR")
+def msvc(roots: tuple[str, ...] = ()) -> dict[str, Any]:
+    configured_root = os.environ.get("VCToolsInstallDir") or os.environ.get("VCINSTALLDIR")
+    root, source = first_matching((("environment:VCToolsInstallDir/VCINSTALLDIR", configured_root),) + argument_roots(roots), lambda path: header(path, "include", "vcruntime.h"))
     tools = {name: tool(name) for name in ("cl", "link", "lib", "vswhere")}
     headers = {"vcruntime.h": header(root, "include", "vcruntime.h")}
     status = "unsupported" if platform.system() != "Windows" else development_status(headers, {"cl": tools["cl"]})
-    return {"status": status, "environment": paths_from_environment(("VSINSTALLDIR", "VCINSTALLDIR", "VCToolsInstallDir", "VCToolsVersion", "VisualStudioVersion")), "root": evidence(root, "environment:VCToolsInstallDir/VCINSTALLDIR"), "headers": headers, "tools": tools}
+    return {"status": status, "environment": paths_from_environment(("VSINSTALLDIR", "VCINSTALLDIR", "VCToolsInstallDir", "VCToolsVersion", "VisualStudioVersion")), "root": evidence(root, source), "headers": headers, "tools": tools}
 
-def directx() -> dict[str, Any]:
+
+def _windows_sdk_version_key(value: str) -> tuple[int, ...]:
+    """Sort Windows SDK include-directory names without assuming they parse."""
+    numbers = re.findall(r"\d+", value)
+    return tuple(int(number) for number in numbers) if numbers else (-1,)
+
+
+def directx(roots: tuple[str, ...] = ()) -> dict[str, Any]:
     if platform.system() != "Windows":
-        return {"status": "unsupported", "root": evidence(None, "windows-sdk"), "headers": {}, "tools": {}}
-    kit_root = os.environ.get("WindowsSdkDir") or registry_values().get("KitsRoot10")
+        return {"status": "unsupported", "root": evidence(None, "windows-sdk"), "include_versions": [], "selected_include_version": None, "header_versions": {}, "headers": {}, "tools": {}}
+    configured_root = os.environ.get("WindowsSdkDir") or registry_values().get("KitsRoot10")
+    kit_root, root_source = first_matching((("environment:WindowsSdkDir/registry:KitsRoot10", configured_root),) + argument_roots(roots), lambda path: (Path(path) / "Include").is_dir())
     include_root = Path(kit_root) / "Include" if kit_root else None
     try:
-        versions = [path for path in include_root.iterdir() if path.is_dir()] if include_root and include_root.is_dir() else []
+        version_paths = [path for path in include_root.iterdir() if path.is_dir()] if include_root and include_root.is_dir() else []
     except OSError:
-        versions = []
+        version_paths = []
+    include_versions = sorted((path.name for path in version_paths), key=_windows_sdk_version_key)
+    requested_version = (os.environ.get("WindowsSDKVersion") or "").strip().rstrip("\\/")
+    selected_include_version = requested_version if requested_version in include_versions else (include_versions[-1] if include_versions else None)
     names = ("d3d11.h", "d3d12.h", "dxgi1_6.h", "dxcapi.h")
-    headers = {name: any((item / "um" / name).is_file() for item in versions) for name in names}
+    header_versions = {name: [path.name for path in version_paths if (path / "um" / name).is_file()] for name in names}
+    headers = {name: bool(values) for name, values in header_versions.items()}
     tools = {"dxc": tool("dxc")}
-    return {"status": development_status(headers, tools), "root": evidence(kit_root, "environment:WindowsSdkDir/registry:KitsRoot10"), "headers": headers, "tools": tools}
+    return {
+        "status": development_status(headers, tools),
+        "root": evidence(kit_root, root_source),
+        "include_versions": include_versions,
+        "selected_include_version": selected_include_version,
+        "selected_include_version_source": "environment:WindowsSDKVersion" if requested_version in include_versions else ("latest_discovered_include_directory" if selected_include_version else "unavailable"),
+        "header_versions": header_versions,
+        "headers": headers,
+        "tools": tools,
+        "dxc_version": version([str(tools["dxc"]["path"]), "--version"]) if tools["dxc"]["path"] else None,
+    }
 
-def apple() -> dict[str, Any]:
+def apple(roots: tuple[str, ...] = ()) -> dict[str, Any]:
     if platform.system() != "Darwin":
         return {"status": "unsupported", "environment": {}, "root": evidence(None, "xcrun:macosx"), "tools": {}}
     xcrun = tool("xcrun")
@@ -147,35 +226,70 @@ def apple() -> dict[str, Any]:
     if not sdk and xcrun["path"]:
         candidate = version([str(xcrun["path"]), "--show-sdk-path", "--sdk", "macosx"])
         sdk = candidate if candidate and Path(candidate).is_dir() else None
-    return {"status": "available" if sdk or xcrun["path"] else "unavailable", "environment": paths_from_environment(("SDKROOT", "DEVELOPER_DIR")), "root": evidence(sdk or os.environ.get("DEVELOPER_DIR"), "environment:SDKROOT/DEVELOPER_DIR" if (sdk or os.environ.get("DEVELOPER_DIR")) else "xcrun:macosx"), "headers": {"Foundation/Foundation.h": header(sdk, "System", "Library", "Frameworks", "Foundation.framework", "Headers", "Foundation.h")}, "tools": {"xcrun": xcrun, "xcodebuild": tool("xcodebuild"), "clang": tool("clang")}}
+    root, source = first_matching((("environment:SDKROOT", sdk), ("environment:DEVELOPER_DIR", os.environ.get("DEVELOPER_DIR"))) + argument_roots(roots), lambda path: header(path, "System", "Library", "Frameworks", "Foundation.framework", "Headers", "Foundation.h"))
+    if not root and sdk:
+        root, source = sdk, "environment:SDKROOT"
+    return {"status": "available" if root or xcrun["path"] else "unavailable", "environment": paths_from_environment(("SDKROOT", "DEVELOPER_DIR")), "root": evidence(root or os.environ.get("DEVELOPER_DIR"), source if root else ("environment:DEVELOPER_DIR" if os.environ.get("DEVELOPER_DIR") else "xcrun:macosx")), "headers": {"Foundation/Foundation.h": header(root, "System", "Library", "Frameworks", "Foundation.framework", "Headers", "Foundation.h")}, "tools": {"xcrun": xcrun, "xcodebuild": tool("xcodebuild"), "clang": tool("clang")}}
 
 
-def emscripten() -> dict[str, Any]:
+def emscripten(roots: tuple[str, ...] = ()) -> dict[str, Any]:
     emcc = tool("emcc")
-    root = os.environ.get("EMSDK")
+    configured_root = os.environ.get("EMSDK")
+    root, source = first_matching((("environment:EMSDK", configured_root),) + argument_roots(roots), lambda path: (Path(path) / "upstream" / "emscripten").is_dir())
     if not root and emcc["path"]:
         candidate = Path(str(emcc["path"])).resolve().parent.parent
         root = str(candidate) if (candidate / "upstream" / "emscripten").is_dir() else None
+        source = "derived:emcc" if root else "not-found"
     tools = {"emcc": emcc, "em++": tool("em++"), "emcmake": tool("emcmake"), "emmake": tool("emmake")}
     markers = {"upstream/emscripten": bool(root and (Path(root) / "upstream" / "emscripten").is_dir())}
-    return {"status": development_status(markers, tools), "environment": paths_from_environment(("EMSDK", "EM_CONFIG", "EMSDK_NODE")), "root": evidence(root, "environment:EMSDK" if os.environ.get("EMSDK") else "derived:emcc"), "markers": markers, "tools": tools, "version": version([str(emcc["path"]), "--version"]) if emcc["path"] else None}
+    return {"status": development_status(markers, tools), "environment": paths_from_environment(("EMSDK", "EM_CONFIG", "EMSDK_NODE")), "root": evidence(root, source), "markers": markers, "tools": tools, "version": version([str(emcc["path"]), "--version"]) if emcc["path"] else None}
 
-def vulkan() -> dict[str, Any]:
-    candidates = [("environment:VULKAN_SDK", os.environ.get("VULKAN_SDK")), ("environment:VK_SDK_PATH", os.environ.get("VK_SDK_PATH")), ("system:/usr", "/usr"), ("system:/usr/local", "/usr/local"), ("system:/opt/vulkan", "/opt/vulkan")]
-    root, source = next(((value, label) for label, value in candidates if value and (header(value, "Include", "vulkan", "vulkan.h") or header(value, "include", "vulkan", "vulkan.h"))), (None, "not-found"))
+def vulkan(roots: tuple[str, ...] = ()) -> dict[str, Any]:
+    windows_roots = conventional_roots("vulkan", (r"C:\VulkanSDK",), depth=1) if platform.system() == "Windows" else ()
+    candidates = [("environment:VULKAN_SDK", os.environ.get("VULKAN_SDK")), ("environment:VK_SDK_PATH", os.environ.get("VK_SDK_PATH")), *argument_roots(roots), *windows_roots, ("system:/usr", "/usr"), ("system:/usr/local", "/usr/local"), ("system:/opt/vulkan", "/opt/vulkan")]
+    root, source = first_matching(tuple(candidates), lambda path: header(path, "Include", "vulkan", "vulkan.h") or header(path, "include", "vulkan", "vulkan.h"))
     headers = {"vulkan.h": header(root, "Include", "vulkan", "vulkan.h") or header(root, "include", "vulkan", "vulkan.h")}
     tools = {"vulkaninfo": tool("vulkaninfo"), "glslc": tool("glslc"), "glslangValidator": tool("glslangValidator")}
     package = package_version(("vulkan",))
-    return {"status": development_status(headers, tools, package), "environment": paths_from_environment(("VULKAN_SDK", "VK_SDK_PATH", "VK_LAYER_PATH", "VK_ICD_FILENAMES")), "root": evidence(root, source), "headers": headers, "package": package, "tools": tools}
+    header_path = None
+    if root:
+        for parts in (("Include", "vulkan", "vulkan_core.h"), ("include", "vulkan", "vulkan_core.h")):
+            candidate = Path(root).joinpath(*parts)
+            if candidate.is_file():
+                header_path = candidate
+                break
+    header_version: dict[str, Any] = {"path": str(header_path) if header_path else None, "VK_HEADER_VERSION": None, "VK_HEADER_VERSION_COMPLETE": None}
+    if header_path:
+        try:
+            text = header_path.read_text(encoding="utf-8", errors="replace")[:512000]
+            for name in ("VK_HEADER_VERSION", "VK_HEADER_VERSION_COMPLETE"):
+                match = re.search(r"^\s*#\s*define\s+%s\s+(.+?)\s*$" % re.escape(name), text, re.MULTILINE)
+                header_version[name] = match.group(1).strip() if match else None
+        except OSError:
+            pass
+    # `vulkaninfo` deliberately exposes report modes, not a documented
+    # standalone version option.  Do not mistake its usage banner for a version.
+    tool_versions = {
+        "vulkaninfo": None,
+        "glslc": version([str(tools["glslc"]["path"]), "--version"]) if tools["glslc"]["path"] else None,
+        "glslangValidator": version([str(tools["glslangValidator"]["path"]), "--version"]) if tools["glslangValidator"]["path"] else None,
+    }
+    tool_version_probes = {
+        "vulkaninfo": {"status": "not_reported", "command": None, "reason": "vulkaninfo has no documented standalone version option"} if tools["vulkaninfo"]["path"] else {"status": "unavailable", "command": None, "reason": "command was not found"},
+        "glslc": {"status": "available" if tool_versions["glslc"] else "unavailable", "command": ["glslc", "--version"] if tools["glslc"]["path"] else None},
+        "glslangValidator": {"status": "available" if tool_versions["glslangValidator"] else "unavailable", "command": ["glslangValidator", "--version"] if tools["glslangValidator"]["path"] else None},
+    }
+    return {"status": development_status(headers, tools, package), "environment": paths_from_environment(("VULKAN_SDK", "VK_SDK_PATH", "VK_LAYER_PATH", "VK_ICD_FILENAMES")), "root": evidence(root, source), "headers": headers, "header_version": header_version, "package": package, "tools": tools, "tool_versions": tool_versions, "tool_version_probes": tool_version_probes}
 
-def nvidia() -> dict[str, Any]:
+def nvidia(roots: tuple[str, ...] = ()) -> dict[str, Any]:
     nvcc = tool("nvcc")
-    roots = paths_from_environment(tuple(name for name in os.environ if re.fullmatch(r"CUDA_(?:PATH|HOME|ROOT)(?:_V\d+_\d+)?", name, re.IGNORECASE)))
-    candidates = [(f"environment:{name}", os.environ.get(name)) for name in os.environ if re.fullmatch(r"CUDA_(?:PATH|HOME|ROOT)(?:_V\d+_\d+)?", name, re.IGNORECASE)] + [("system:/usr/local/cuda", "/usr/local/cuda"), ("system:/opt/cuda", "/opt/cuda")]
-    primary, source = next(((value, label) for label, value in candidates if value and header(value, "include", "cuda.h")), (None, "not-found"))
+    environment = paths_from_environment(tuple(name for name in os.environ if re.fullmatch(r"CUDA_(?:PATH|HOME|ROOT)(?:_V\d+_\d+)?", name, re.IGNORECASE)))
+    windows_roots = conventional_roots("cuda", windows_program_files("NVIDIA GPU Computing Toolkit", "CUDA"), depth=1)
+    candidates = [(f"environment:{name}", os.environ.get(name)) for name in os.environ if re.fullmatch(r"CUDA_(?:PATH|HOME|ROOT)(?:_V\d+_\d+)?", name, re.IGNORECASE)] + [*argument_roots(roots), *windows_roots, ("system:/usr/local/cuda", "/usr/local/cuda"), ("system:/opt/cuda", "/opt/cuda")]
+    primary, source = first_matching(tuple(candidates), lambda path: header(path, "include", "cuda.h"))
     headers = {"cuda.h": header(primary, "include", "cuda.h")}
     tools = {"nvcc": nvcc, "nvidia-smi": tool("nvidia-smi")}
-    return {"status": development_status(headers, {"nvcc": nvcc}), "environment": roots, "cuda_root": evidence(primary, source), "headers": headers, "tools": tools, "nvcc_version": version([str(nvcc["path"]), "--version"]) if nvcc["path"] else None}
+    return {"status": development_status(headers, {"nvcc": nvcc}), "environment": environment, "cuda_root": evidence(primary, source), "headers": headers, "tools": tools, "nvcc_version": version([str(nvcc["path"]), "--version"]) if nvcc["path"] else None}
 
 def registry_values() -> dict[str, str]:
     if platform.system() != "Windows":
@@ -197,19 +311,20 @@ def _registry_has(key: Any, name: str) -> bool:
         return False
 
 
-def windows() -> dict[str, Any]:
+def windows(roots: tuple[str, ...] = ()) -> dict[str, Any]:
     registry = registry_values()
-    roots = paths_from_environment(("WindowsSdkDir", "WindowsSDKVersion", "UniversalCRTSdkDir", "VCToolsInstallDir"))
-    roots.update({name: evidence(value, f"registry:Windows Kits Installed Roots/{name}") for name, value in registry.items()})
-    kit_root = os.environ.get("WindowsSdkDir") or registry.get("KitsRoot10")
+    environment = paths_from_environment(("WindowsSdkDir", "WindowsSDKVersion", "UniversalCRTSdkDir", "VCToolsInstallDir"))
+    environment.update({name: evidence(value, f"registry:Windows Kits Installed Roots/{name}") for name, value in registry.items()})
+    configured_root = os.environ.get("WindowsSdkDir") or registry.get("KitsRoot10")
+    kit_root, root_source = first_matching((("environment:WindowsSdkDir/registry:KitsRoot10", configured_root),) + argument_roots(roots), lambda path: (Path(path) / "Include").is_dir())
     try:
         includes = list((Path(kit_root) / "Include").glob("*")) if kit_root and (Path(kit_root) / "Include").is_dir() else []
     except OSError:
         includes = []
     return {
         "status": "available" if kit_root else ("unsupported" if platform.system() != "Windows" else "unavailable"),
-        "roots": roots,
-        "windows_sdk_root": evidence(kit_root, "environment:WindowsSdkDir" if os.environ.get("WindowsSdkDir") else "registry:KitsRoot10"),
+        "roots": environment,
+        "windows_sdk_root": evidence(kit_root, root_source),
         "include_versions": sorted(path.name for path in includes if path.is_dir()),
         "tools": {"rc": tool("rc"), "midl": tool("midl"), "cl": tool("cl")},
     }
@@ -243,12 +358,20 @@ def human_section_lines(name: str, item: dict[str, Any]) -> list[str]:
         found = [f"{key}={value['path']}" for key, value in tools.items() if isinstance(value, dict) and value.get("path")]
         if found:
             lines.append("  tools: " + "; ".join(found))
+    if name == "directx":
+        selected = item.get("selected_include_version")
+        versions = item.get("include_versions")
+        if selected:
+            lines.append("  selected Windows SDK include version: %s" % selected)
+        if isinstance(versions, list) and versions:
+            lines.append("  discovered Windows SDK include versions: " + ", ".join(str(value) for value in versions))
     return lines
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Find local C/C++ SDK and library-development evidence without installing or invoking builds.")
     parser.add_argument("--sections", default=",".join(SECTIONS), help="comma-separated: android,apple,boost,directx,emscripten,msvc,nvidia,openssl,qt,sdl,vulkan,windows; aliases: cuda,win32,dx,ndk,emsdk,ssl")
+    parser.add_argument("--root", action="append", default=[], metavar="PATH", help="explicit SDK root to check directly; repeat for multiple roots")
     parser.add_argument("--json", action="store_true", help="emit the full machine-readable report")
     args = parser.parse_args()
     requested = tuple(part.strip().casefold() for part in args.sections.split(",") if part.strip())
@@ -257,7 +380,8 @@ def main() -> int:
     if invalid or not selected:
         parser.error("--sections must contain one or more of: " + ", ".join(SECTIONS))
     collectors = {"android": android, "apple": apple, "boost": boost, "directx": directx, "emscripten": emscripten, "msvc": msvc, "nvidia": nvidia, "openssl": openssl, "qt": qt, "sdl": sdl, "vulkan": vulkan, "windows": windows}
-    report = {"tool": "sdk_info", "schema_version": 3, "platform": {"system": platform.system(), "machine": platform.machine()}, "requested_sections": list(requested), "selected_sections": list(selected), "section_aliases": {name: ALIASES[name] for name in requested if name in ALIASES}, "sections": {name: collectors[name]() for name in selected}}
+    roots = tuple(args.root)
+    report = {"tool": "sdk_info", "schema_version": 4, "platform": {"system": platform.system(), "machine": platform.machine()}, "requested_sections": list(requested), "selected_sections": list(selected), "section_aliases": {name: ALIASES[name] for name in requested if name in ALIASES}, "requested_roots": list(roots), "sections": {name: collectors[name](roots) for name in selected}}
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
