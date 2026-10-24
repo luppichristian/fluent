@@ -1,6 +1,3 @@
-# fluent resource index
-
-<!-- Maintained manually; verified by .github/workflows/gen_jump_file.py. -->
 
 ## rules
 
